@@ -1,0 +1,11 @@
+{
+  "icon": "hand.point.up.left",
+  "hidden": true,
+  "model": "sonnet",
+  "tools": [],
+  "mcp": [],
+  "maxTurns": 2,
+  "effort": "low",
+  "stream": true,
+  "thinkingOff": ["haiku", "claude-haiku-4"]
+}

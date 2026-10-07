@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Penpal's hardened runtime (needed to notarize): only what it uses, also asked for by macOS (#315). -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key><true/>  <!-- Claude History opens Terminal; the Claude app's menus -->
+</dict>
+</plist>

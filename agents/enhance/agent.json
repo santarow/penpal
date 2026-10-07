@@ -1,0 +1,10 @@
+{
+  "icon": "wand.and.stars",
+  "hidden": true,
+  "model": "sonnet",
+  "tools": [],
+  "mcp": [],
+  "maxTurns": 2,
+  "effort": "low",
+  "thinkingOff": ["haiku", "claude-haiku-4"]
+}

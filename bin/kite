@@ -1,0 +1,1332 @@
+#!/usr/bin/env python3
+"""kite: run an agent in the background with the user's own `claude`.
+
+  kite run <agent> "question" [--image shot.png]      start a run, return right away
+  kite follow <run|last> "..." [--image shot.png]    new run that resumes <run>'s session
+  kite warm <agent> [--resume <session>] [--effort low]   a claude started ahead; one run from stdin (JSON)
+  kite mode [lens|none]            show or set the mode every agent talks in
+  kite history [n]                 your Claude Code sessions (not Kite's agents), newest first, as JSON
+  kite session <file.jsonl>        one session's turns: prompt, answer, tokens, images (saved under ~/.kite/history)
+  kite usage [today|7]             live tokens from local transcripts + plan limits and their /usage history, as JSON
+  kite limits                      plan limits from Claude Code's /usage (no model call, zero tokens)
+  kite commands [refresh]          Claude Code commands, your skills, and keys incl. your keybindings.json, as JSON
+                                   (refresh re-downloads the lists from code.claude.com/docs)
+Options for run and follow: --kind pull|chat|..., --context file.md (sent first, not shown),
+                                  --model opus|sonnet|haiku|<id> (else agent.json "model", else your default)
+  kite status                      list runs, newest first
+  kite open [run]                  open a run's result (default: newest done)
+
+Each run is a folder of plain files: agents/<agent>/runs/<id>/
+  input.md  [input.png]  mode  events.jsonl  status  pid  result.md  session_id  meta.json
+The mode is a lens name in ~/.kite/mode (plain text), shared with Kite.app. Lenses are yours:
+~/.kite/lenses/*.md (My lenses) and each subfolder (a set), the way Kite.app resolves them (Lenses.swift).
+The repo's lenses/ folder holds the defaults the app copies in on first load; until then they're used.
+"""
+
+import base64
+import calendar
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILTIN = ROOT / "agents"                 # agents that ship with Kite: definitions only
+AGENTS = Path(os.environ.get("KITE_AGENTS") or Path.home() / ".kite" / "agents")  # yours: every agent's runs, and your missions
+
+
+def agent_home(agent):
+    """Where an agent's persona.md and agent.json live: yours first (missions), else the built-in one."""
+    for base in (AGENTS, BUILTIN):
+        if (base / agent / "persona.md").exists():
+            return base / agent
+    die(f"no agent {agent} (looked in {AGENTS} and {BUILTIN})")
+def find_claude():
+    """The user's own claude: KITE_CLAUDE, else PATH, else the usual install spots (native, Homebrew, npm)."""
+    if os.environ.get("KITE_CLAUDE"):
+        return os.environ["KITE_CLAUDE"]
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = Path.home()
+    for c in (home / ".local/bin/claude", Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude"), home / ".claude/local/claude"):
+        if c.exists():
+            return str(c)
+    return "claude"
+
+
+CLAUDE = find_claude()
+LENSES = ROOT / "lenses"
+USER_LENSES = Path.home() / ".kite" / "lenses"  # yours: "My lenses" at the top, other sets in subfolders
+
+
+def lens_sets():
+    """Every lens folder, as Lenses.swift reads them: My lenses, then each set (a subfolder) by name. The repo's
+    lenses/ are the defaults Penpal copies in on first load (#261); they count only until it has."""
+    subs = sorted(p for p in USER_LENSES.iterdir() if p.is_dir()) if USER_LENSES.is_dir() else []
+    yours = [USER_LENSES, *subs]
+    return yours if any(any(f.glob("*.md")) for f in yours) else [LENSES, LENSES / "fun"]
+
+
+def lenses():
+    """The lens each name means right now, as Lenses.swift's active(): between your sets, the first one wins. Names are lowercase, like the app's. (The app
+    can switch a set off; that switch lives in the app's own preferences, so here every set is on.)"""
+    out = {}
+    for folder in lens_sets():
+        for f in sorted(folder.glob("*.md")):
+            name = f.stem.lower()
+            if name not in out:
+                out[name] = f
+    return out
+
+
+def lens_file(name):
+    """The lens a mode names, or None."""
+    return lenses().get((name or "").strip().lower())
+
+
+MODE_FILE = Path.home() / ".kite" / "mode"
+
+
+def policy():
+    """The organization's policy (see Features.swift): the enforced file in /Library, else a trial one in ~/.kite."""
+    for path in (Path("/Library/Application Support/Kite/policy.json"), Path.home() / ".kite" / "policy.json"):
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+
+def allowed_tools(cfg, agent=None):
+    """An agent's tools and MCP servers, minus what the policy denies and what you switched off in
+    the Toolbox. Returns (servers, tools, allowed, denied): denied names single MCP tools that are
+    off, for --disallowedTools (a server is dropped once all of its tools are off)."""
+    pol = policy()
+    deny_tools, deny_mcp = set(pol.get("deny_tools", [])), set(pol.get("deny_mcp", []))
+    off = set()
+    servers = {n: MCP_SERVERS[n] for n in cfg.get("mcp", []) if n in MCP_SERVERS and n not in deny_mcp}
+    tools = [t for t in cfg.get("tools", []) if t not in deny_tools and t not in off]
+    denied = sorted(t for t in off if t.startswith("mcp__") and t.split("__")[1] in servers)
+    return servers, ",".join(tools), ",".join(tools + [f"mcp__{n}" for n in servers]), ",".join(denied)
+
+
+
+
+def current_mode():
+    name = MODE_FILE.read_text().strip().lower() if MODE_FILE.exists() else ""
+    return name if lens_file(name) else ""
+
+
+def cmd_mode(name=None):
+    if name is None:
+        print(current_mode() or "none")
+        return
+    name = name.strip().lower()
+    if name != "none" and not lens_file(name):
+        die(f"no lens {name} (have: {', '.join(sorted(lenses()))})")
+    MODE_FILE.parent.mkdir(exist_ok=True)
+    MODE_FILE.write_text("" if name == "none" else name + "\n")
+    print(f"mode: {name}")
+
+
+def die(msg):
+    sys.exit(f"kite: {msg}")
+
+
+def all_runs():
+    runs = [r for r in AGENTS.glob("*/runs/*") if r.is_dir()]
+    return sorted(runs, key=lambda r: r.name, reverse=True)
+
+
+def find_run(run_id):
+    for r in all_runs():
+        if r.name == run_id:
+            return r
+    die(f"no run {run_id}")
+
+
+def status(run):
+    s = (run / "status").read_text().strip() if (run / "status").exists() else "starting"
+    if s == "working" and not alive(run):
+        return "died"
+    return s
+
+
+def alive(run):
+    try:
+        os.kill(int((run / "pid").read_text()), 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return False
+
+
+RUN_MODEL = None  # --model for this invocation, set in main()
+RUN_EFFORT = None  # --effort for this invocation (low … max), set in main()
+
+
+def start(agent, text, resume=None, image=None, kind=None, context=None, extra=None, model=None, effort=None):
+    run = make_run(agent, text, resume, image, kind, context, extra, model, effort)
+    p = subprocess.Popen(
+        [sys.executable, __file__, "_work", str(run)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    (run / "pid").write_text(str(p.pid))
+    print(f"{agent}/{run.name} working")
+
+
+def make_run(agent, text, resume=None, image=None, kind=None, context=None, extra=None, model=None, effort=None):
+    """A new run's folder, with its input, marked working."""
+    agent_home(agent)  # dies if there's no such agent
+    base = AGENTS / agent / "runs" / time.strftime("%Y%m%d-%H%M%S")
+    run, n = base, 1
+    while True:  # two runs in the same second get -2, -3, ...
+        try:
+            run.mkdir(parents=True)
+            break
+        except FileExistsError:
+            n += 1
+            run = base.with_name(f"{base.name}-{n}")
+    (run / "input.md").write_text(text.strip() + "\n")
+    if image:
+        shutil.copyfile(image, run / "input.png")
+    if current_mode():
+        (run / "mode").write_text(current_mode() + "\n")  # the mode is fixed per run
+    if resume:
+        (run / "resume").write_text(resume)
+    if kind:
+        (run / "kind").write_text(kind + "\n")
+    if model or RUN_MODEL:  # the agent's own model (mission.json) wins over the app's Missions setting
+        (run / "model").write_text((model or RUN_MODEL) + "\n")
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        (run / "effort").write_text(effort + "\n")
+    if context:
+        (run / "context.md").write_text(Path(context).read_text() if Path(context).exists() else context)
+    for name, value in (extra or {}).items():  # e.g. satellite, batch
+        (run / name).write_text(value + "\n")
+    (run / "status").write_text("working\n")
+    return run
+
+
+def warm(agent, resume=None, idle=600):
+    """A claude started ahead of its run, so the run skips claude's start-up (claude-kite #254: about
+    0.7 to 1 s of Penpal's Enhance and Guide me). Unlike `live`, it takes ONE message: a fresh claude
+    for each run, so one ask never sees another (or, with --resume, the session that run follows).
+    Prints "ready", then waits for one request line on stdin:
+        {"text": "...", "image": "/path.png", "context": "/path.md", "kind": "..."}   (image, context, kind optional)
+    makes the run folder as `run` would, prints "<agent>/<run> working", and records the run like any other.
+    With no request in `idle` seconds (10 minutes), claude is stopped and nothing is left behind."""
+    import select
+    workdir = AGENTS / agent
+    workdir.mkdir(parents=True, exist_ok=True)
+    cmd = agent_cmd(agent, current_mode() or "", RUN_MODEL, RUN_EFFORT, resume) + ["--input-format", "stream-json"]
+    err_path = workdir / f".warm-{os.getpid()}.err"
+    env = agent_env(agent, RUN_MODEL)
+    p = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(err_path, "w"),
+                         text=True, env=env)
+    print("ready", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], idle)
+    line = sys.stdin.readline() if ready else ""
+    if not line.strip():  # idle, or the app let go of us
+        p.kill()
+        err_path.unlink(missing_ok=True)
+        return
+    req = json.loads(line)
+    run = make_run(agent, req["text"], resume=resume, image=req.get("image"), kind=req.get("kind"),
+                   context=req.get("context"), model=RUN_MODEL, effort=RUN_EFFORT)
+    (run / "pid").write_text(str(os.getpid()))
+    print(f"{agent}/{run.name} working", flush=True)
+    if (run / "context.md").exists():  # as `work` gives it: background first, then the words
+        (run / "prompt.md").write_text((run / "context.md").read_text().strip() + "\n\n---\n\n" + (run / "input.md").read_text())
+    p.stdin.write(user_message(run))
+    p.stdin.close()
+    shutil.move(str(err_path), str(run / "stderr.txt"))
+    collect(run, p)
+
+
+# MCP servers an agent can name in agent.json "mcp". Read-only, no keys.
+MCP_SERVERS = {
+}
+
+
+def work(run):
+    """The background worker: one `claude -p` process, events saved as they arrive.
+
+    A lean side chat, not a coding session: the persona replaces Claude Code's system
+    prompt, and no user settings, CLAUDE.md, skills or hooks load. Only the tools in
+    agent.json, and only the MCP servers it names.
+    """
+    workdir = run.parent.parent               # ~/.kite/agents/<name>: outside any repo, so no project memory
+    mode = (run / "mode").read_text().strip() if (run / "mode").exists() else ""
+    model = (run / "model").read_text().strip() if (run / "model").exists() else None
+    effort = (run / "effort").read_text().strip() if (run / "effort").exists() else None
+    resume = (run / "resume").read_text().strip() if (run / "resume").exists() else None
+    cmd = agent_cmd(run.parent.parent.name, mode, model, effort, resume)
+    if (run / "heartbeat").exists():
+        # A heartbeat: is Claude answering? One tiny turn, nothing else loaded: no persona, memory,
+        # location, tools, MCP servers or session kept. Only the model and effort you picked.
+        cmd = [CLAUDE, "-p", "--output-format", "stream-json", "--verbose",
+               "--system-prompt", "Reply with exactly: ok", "--setting-sources", "", "--disable-slash-commands",
+               "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}}), "--tools", "",
+               "--max-turns", "1", "--no-session-persistence"]
+        cmd += ["--model", model or "haiku", "--effort", effort or "low"]
+    # claude -p waits only 3 s for piped stdin, so feed the input as a file.
+    # With a screenshot, the input is one stream-json user message: the image, then the text.
+    feed = run / "input.md"
+    if (run / "context.md").exists():  # background for the model, not shown as the user's words
+        feed = run / "prompt.md"
+        feed.write_text((run / "context.md").read_text().strip() + "\n\n---\n\n" + (run / "input.md").read_text())
+    if (run / "input.png").exists():
+        cmd += ["--input-format", "stream-json"]
+        feed = run / "input.jsonl"
+        feed.write_text(user_message(run))
+    with open(feed) as stdin:
+        env = agent_env(run.parent.parent.name, model)  # no auto-memory; thinking off where agent.json says
+        p = subprocess.Popen(cmd, cwd=workdir, stdin=stdin, stdout=subprocess.PIPE, stderr=open(run / "stderr.txt", "w"), text=True, env=env)
+        collect(run, p)
+
+
+def user_message(run):
+    """The run's input as one stream-json user message: the screenshot if any, then the text (with its context)."""
+    text = (run / "prompt.md" if (run / "prompt.md").exists() else run / "input.md").read_text()
+    content = []
+    if (run / "input.png").exists():
+        png = base64.b64encode((run / "input.png").read_bytes()).decode()
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}})
+    content.append({"type": "text", "text": text})
+    return json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
+
+
+# What kite itself sets for the claude it starts; every other CLAUDE_CODE_* from outside is dropped (claude_env).
+OWN_CLAUDE_CODE = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY"}
+
+
+def claude_env():
+    """The environment the user's own claude runs in: their Claude Code login and plan, never a key, endpoint or provider
+    inherited from wherever kite was started (billing guard). Dropped: ANTHROPIC_* (an API key, auth token or base URL
+    would bill the API or send the run elsewhere), CLAUDECODE and inherited CLAUDE_CODE_* (a parent Claude session's,
+    or CLAUDE_CODE_USE_BEDROCK / _VERTEX), except the ones kite sets. Kept: CLAUDE_CONFIG_DIR, which only says where
+    the login lives (stripping it would send Claude Code to ~/.claude, maybe no login or another account).
+    Agents run inside this repo, so CLAUDE_CODE_DISABLE_AUTO_MEMORY keeps Claude Code's auto-memory for it out."""
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("ANTHROPIC_") or k == "CLAUDECODE" or (k.startswith("CLAUDE_CODE_") and k not in OWN_CLAUDE_CODE))}
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return env
+
+
+def agent_env(agent, model=None):
+    """The environment an agent's claude runs in. Agents run inside this repo, so without CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    they'd also read Claude Code's auto-memory for it. With agent.json "thinkingOff": ["haiku"], that model runs with
+    thinking off (MAX_THINKING_TOKENS=0, which Claude Code honours; --effort doesn't stop Haiku thinking): Enhance on
+    Haiku went from about 28 s to 3 s (#296)."""
+    env = claude_env()
+    try:
+        cfg = json.loads((agent_home(agent) / "agent.json").read_text())
+    except (OSError, ValueError):
+        return env
+    m = (model or cfg.get("model") or "").lower()
+    # Exact or leading match, so "haiku" (Claude Code's alias, Haiku 4.5) doesn't also catch claude-haiku-5-5, which
+    # ignores the variable and keeps its adaptive thinking short at effort low instead (#302).
+    if m and any(m == k or m.startswith(k) for k in cfg.get("thinkingOff", [])):
+        env["MAX_THINKING_TOKENS"] = "0"
+    return env
+
+
+def agent_cmd(agent, mode="", model=None, effort=None, resume=None):
+    """The `claude -p` command for one of the agent's runs (what `work` and `warm` start)."""
+    home = agent_home(agent)  # persona and tools
+    cfg = json.loads((home / "agent.json").read_text())
+    servers, tools, allowed, denied = allowed_tools(cfg, agent)  # minus policy and Toolbox
+    now = time.strftime("%A %B %-d, %Y, %H:%M %Z")
+    persona = f"Today is {now}.\n\n" + (home / "persona.md").read_text()
+    lens = lens_file(mode)
+    if lens:
+        persona += ("\n\n---\n\nThe user picked a mode. Talk to them this way, on top of your role above:\n\n"
+                    + lens.read_text())
+    # An officer (a mission with a plugin) gets that plugin's skills, and the Skill tool to use them.
+    # Everything else stays lean: no skills at all.
+    skills = ["--disable-slash-commands"]
+    cmd = [
+        CLAUDE, "-p",
+        "--output-format", "stream-json", "--verbose",
+        "--system-prompt", persona,
+        "--setting-sources", "", *skills,
+        "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": servers}),
+        "--tools", tools, "--allowedTools", allowed,
+        "--max-turns", str(cfg.get("maxTurns", 10)),
+    ] + (["--disallowedTools", denied] if denied else [])
+    if cfg.get("stream"):  # the answer as it's written, into events.jsonl (Guide me rings each step as it comes, #259)
+        cmd += ["--include-partial-messages"]
+    model = model or cfg.get("model")
+    if model:
+        cmd += ["--model", model]  # the user's pick for this kind of run, or the agent's own (guide: sonnet)
+    effort = effort or cfg.get("effort")  # low … max; none = Claude Code's default
+    if effort in ("low", "medium", "high", "xhigh", "max"):
+        cmd += ["--effort", effort]
+    if resume:
+        cmd += ["--resume", resume]
+    return cmd
+
+
+def collect(run, p):
+    """A run's claude, read to the end: events saved as they arrive, then its result, meta and status."""
+    result = None
+    error_kind = None  # what Claude Code says went wrong, e.g. model_not_found (#302: a model its version can't run)
+    with open(run / "events.jsonl", "w") as log:
+        for line in p.stdout:
+            log.write(line)
+            log.flush()
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "assistant" and ev.get("error"):
+                error_kind = ev["error"]
+            if ev.get("type") == "result":
+                result = ev
+        p.wait()
+    if result and not result.get("is_error") and result.get("subtype") == "success":
+        text = result.get("result", "").strip()
+        if (run / "heartbeat").exists():  # the report is the answer's speed, not the "ok"
+            text = f"Online · Claude answered in {result.get('duration_ms', 0) / 1000:.1f} s"
+            (run / "seen").touch()  # nothing to read: no unread dot
+        (run / "result.md").write_text(text + "\n")
+        (run / "session_id").write_text(result["session_id"])
+        (run / "status").write_text("done\n")
+    else:
+        if result and result.get("session_id"):
+            (run / "session_id").write_text(result["session_id"])
+        if error_kind:
+            (run / "error_kind").write_text(error_kind + "\n")
+        (run / "status").write_text("error\n")
+    record_model(run, result)
+    keep = ("subtype", "num_turns", "duration_ms", "total_cost_usd", "session_id", "usage")
+    meta = {k: result.get(k) for k in keep} if result else {}
+    meta["exit_code"] = p.returncode
+    (run / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def cmd_status():
+    runs = all_runs()
+    if not runs:
+        print("no runs yet")
+        return
+    for r in runs:
+        first = (r / "input.md").read_text().strip().splitlines()[0][:60]
+        print(f"{status(r):8} {r.parent.parent.name}/{r.name}  {first}")
+
+
+def cmd_open(run_id=None):
+    if run_id:
+        run = find_run(run_id)
+    else:
+        run = next((r for r in all_runs() if status(r) == "done"), None) or die("no done runs")
+    f = run / "result.md"
+    if not f.exists():
+        die(f"{run.name} is {status(run)}, no result yet")
+    subprocess.run(["open", str(f)])
+
+
+# ---------- Usage: tokens from ~/.claude/projects transcripts, limits from rate_limit_event ----------
+
+TYPES = ("input", "output", "cache_write", "cache_read")
+USAGE_CACHE = Path.home() / ".kite" / "usage-cache-v3.json"
+
+
+def file_usage(path):
+    """Every API request in one transcript: [message id, request id, unix time, model, 4 token counts].
+    Claude Code's <synthetic> placeholders are not requests and are left out."""
+    out = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            m = d.get("message") if isinstance(d.get("message"), dict) else None
+            u = m and m.get("usage")
+            if not u or not d.get("timestamp") or m.get("model") == "<synthetic>":
+                continue
+            out.append([m.get("id"), d.get("requestId"),
+                        calendar.timegm(time.strptime(d["timestamp"][:19], "%Y-%m-%dT%H:%M:%S")), m.get("model", "?"),
+                        u.get("input_tokens", 0) or 0, u.get("output_tokens", 0) or 0,
+                        u.get("cache_creation_input_tokens", 0) or 0, u.get("cache_read_input_tokens", 0) or 0])
+    return out
+
+
+LIMITS_FILE = Path.home() / ".kite" / "limits-v2.json"
+
+
+def reset_time(text, tz):
+    """'Sep 24 at 6:59pm' in America/Los_Angeles -> unix time. The year is the next one that fits."""
+    if not text:
+        return None
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    m = re.match(r"(\w{3}) (\d{1,2}) at (\d{1,2})(?::(\d{2}))?(am|pm)", text.strip())
+    if not m:
+        return None
+    zone = ZoneInfo(tz) if tz else None
+    now = datetime.now(zone)
+    hour = int(m.group(3)) % 12 + (12 if m.group(5) == "pm" else 0)
+    for year in (now.year, now.year + 1):
+        d = datetime.strptime(f"{m.group(1)} {m.group(2)} {year}", "%b %d %Y").replace(
+            hour=hour, minute=int(m.group(4) or 0), tzinfo=zone)
+        if d.timestamp() >= now.timestamp() - 3600:
+            return int(d.timestamp())
+    return None
+
+
+def cmd_limits():
+    """Plan limits from Claude Code's own /usage, run headless: no model call, zero tokens.
+    Shape: {"at", "windows": [{"name", "pct", "resets"}], "notes": [...]} (saved to ~/.kite/limits.json)."""
+    ping = AGENTS / "_ping"  # a folder of its own, so this never touches a real project
+    ping.mkdir(parents=True, exist_ok=True)
+    (ping / "usage.md").write_text("/usage\n")
+    # --no-session-persistence: a /usage check isn't a session. Saved, each one showed up as a session
+    # in Claude's stats card (and Kite's), one every 15 minutes.
+    cmd = [CLAUDE, "-p", "--output-format", "json", "--setting-sources", "", "--strict-mcp-config", "--no-session-persistence"]
+    env = claude_env()
+    with open(ping / "usage.md") as stdin:
+        r = subprocess.run(cmd, cwd=ping, stdin=stdin, capture_output=True, text=True, env=env, timeout=60)
+    text = json.loads(r.stdout or "{}").get("result", "")
+    windows, notes, section = [], [], None
+    for line in text.splitlines():
+        m = re.match(r"^Current (session|week \(([^)]+)\)): (\d+)% used(?: · resets (.+?)(?: \(([^)]*)\))?)?$", line.strip())
+        if m:
+            # Named the way Claude's own usage panel names them.
+            name = "5-hour limit" if m.group(1) == "session" else f"Weekly · {m.group(2)}"
+            windows.append({"name": name, "pct": int(m.group(3)), "resets": m.group(4) or "",
+                            "resetsAt": reset_time(m.group(4), m.group(5))})
+        elif line.startswith("What's contributing"):
+            section = []
+        elif section is not None and line.strip():
+            notes.append(line.rstrip())
+    if not windows:
+        die("no limits in /usage output")
+    info = {"at": int(time.time()), "windows": windows, "notes": notes}
+    LIMITS_FILE.parent.mkdir(exist_ok=True)
+    LIMITS_FILE.write_text(json.dumps(info))
+    # History: /usage only shows the current windows, so keep each reading that changed (or every 30 min).
+    hist = Path.home() / ".kite" / "usage" / "limits.jsonl"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    last = json.loads(hist.read_text().splitlines()[-1]) if hist.exists() and hist.stat().st_size else None
+    point = {"at": info["at"], **{w["name"]: w["pct"] for w in windows}}
+    if not last or any(last.get(k) != v for k, v in point.items() if k != "at") or info["at"] - last["at"] >= 1800:
+        with hist.open("a") as f:
+            f.write(json.dumps(point) + "\n")
+    print(json.dumps(info))
+
+
+def latest_limits():
+    """The newest rate_limit_event from any Kite run or `kite limits`: real plan usage, as Claude reports it."""
+    saved = json.loads(LIMITS_FILE.read_text()) if LIMITS_FILE.exists() else None
+    best = None
+    for ev in sorted(AGENTS.glob("**/runs/*/events.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+        for line in open(ev, errors="replace"):
+            if '"rate_limit_event"' in line:
+                info = json.loads(line).get("rate_limit_info", {})
+                if not best:
+                    w = info.get("unifiedWindows") or {}
+                    fmt = lambda t: time.strftime("%b %-d at %-I:%M%p", time.localtime(t)).replace("AM", "am").replace("PM", "pm") if t else ""
+                    best = {"at": int(ev.stat().st_mtime), "notes": [], "windows": [
+                        {"name": n, "pct": round(w[k]["utilization"] * 100), "resets": fmt(w[k].get("resetsAt")),
+                         "resetsAt": w[k].get("resetsAt")}
+                        for k, n in (("five_hour", "5-hour limit"), ("seven_day", "Weekly · all models")) if k in w]}
+        if best:
+            break
+    return max((x for x in (best, saved) if x), key=lambda x: x["at"], default=None)
+
+
+USAGE_DIR = Path.home() / ".kite" / "usage"  # history lives here: /usage readings only (limits.jsonl)
+
+
+def cmd_usage(period="7"):
+    """Live tokens and requests from Claude Code's transcripts, today or the last 7 days: the part that
+    ties out with /usage (850 requests in 24 h, 2,223 in 7 d, 2026-09-24). Nothing derived is saved as
+    history; the only history Kite keeps is /usage's own readings."""
+    if period not in ("today", "7"):
+        die("usage covers today or 7 (days): the periods /usage can confirm")
+    now = time.time()
+    lt = time.localtime(now)
+    since = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)) if period == "today" else now - 7 * 86400
+    days = 1 if period == "today" else 7
+    cache = json.loads(USAGE_CACHE.read_text()) if USAGE_CACHE.exists() else {}
+    projects = Path.home() / ".claude" / "projects"
+    seen, rows, times = set(), [], []
+    # Subagent transcripts sit one level deeper (<session>/subagents/*.jsonl), so search all levels.
+    for path in sorted(projects.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime):
+        st = path.stat()
+        if st.st_mtime < now - 8 * 86400:
+            continue
+        stamp = f"{st.st_mtime}:{st.st_size}"
+        if cache.get(str(path), {}).get("stamp") != stamp:
+            cache[str(path)] = {"stamp": stamp, "requests": file_usage(path)}
+        proj = path.relative_to(projects).parts[0]
+        # Kite's own agent runs live in <repo>/agents/<name>, so their project folder says so.
+        source = "kite" if "-agents-" in proj else "claude code"
+        for mid, rid, at, model, *tok in cache[str(path)]["requests"]:
+            if (mid, rid) in seen or at > now:  # resumed and forked sessions copy earlier messages
+                continue
+            seen.add((mid, rid))
+            times.append(at)
+            if at >= since:
+                rows.append({"day": time.strftime("%Y-%m-%d", time.localtime(at)), "model": model, "project": proj,
+                             "source": source, **dict(zip(TYPES, tok))})
+    USAGE_CACHE.parent.mkdir(exist_ok=True)
+    USAGE_DIR.mkdir(parents=True, exist_ok=True)
+    USAGE_CACHE.write_text(json.dumps({k: v for k, v in cache.items() if Path(k).exists()}))  # speed only
+    first = time.strftime("%Y-%m-%d", time.localtime(since))
+    hist = USAGE_DIR / "limits.jsonl"
+    history = [json.loads(l) for l in hist.read_text().splitlines()[-2000:]] if hist.exists() else []
+    extra = {"period": period, "period_requests": len(rows), "history": history}
+
+    def group(key):
+        g = {}
+        for r in rows:
+            t = g.setdefault(r[key], dict.fromkeys(TYPES, 0))
+            for k in TYPES:
+                t[k] += r[k]
+        return g
+
+    total = dict.fromkeys(TYPES, 0)
+    for r in rows:
+        for k in TYPES:
+            total[k] += r[k]
+    limits = latest_limits()
+    # Requests are counted as of the /usage reading, so its "Last 24h · N requests" and "Last 7d" lines
+    # and ours cover the same minute and can tie out exactly (Kite shows whether they do). Without a
+    # reading that has those lines, as of now.
+    ref = limits["at"] if limits and limits.get("notes") else now
+    out = {**extra, "days": days, "from": first, "total": total,
+           "requests_24h": sum(1 for t in times if ref - 86400 <= t <= ref),
+           "requests_7d": sum(1 for t in times if ref - 7 * 86400 <= t <= ref), "by_day": group("day"), "by_source": group("source"),
+           "by_model": group("model"), "by_project": group("project"), "limits": limits}
+    # Tie-out: every breakdown must add back to the total.
+    out["ties_out"] = all(sum(g[x][k] for x in g) == total[k] for g in (out["by_day"], out["by_source"], out["by_model"], out["by_project"]) for k in TYPES)
+    text = json.dumps(out)
+    # The last report, so Kite can show it at once next time while this one is re-made. Replaced each run.
+    (USAGE_DIR / f"last-{period}.json").write_text(text)
+    print(text)
+
+
+# ---------- Activity: all time, like the Claude app's stats card, but each reply counted once ----------
+#
+# Worked out from this Mac's transcripts (they can be deleted or edited), so it's labelled as such and
+# never saved as history. Days before Claude Code's own stats-cache.json was last computed come from
+# that file (Claude's counting). The card's token total adds each reply once per line it's written on
+# (a reply takes ~2 lines: thinking, text, tool use); Kite shows both, from the same scan.
+
+ACTIVITY_CACHE = Path.home() / ".kite" / "activity-cache-v1.json"
+
+
+def file_activity(path):
+    """One transcript, the Claude card's way: message lines per local day (user and assistant, not
+    side chains), each session's first local time, and every line's model and tokens with its key."""
+    lines, sessions, usage = {}, {}, []
+    with open(path, errors="replace") as f:
+        for raw in f:
+            if '"timestamp"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") not in ("user", "assistant") or not d.get("timestamp"):
+                continue
+            at = calendar.timegm(time.strptime(d["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+            day = time.strftime("%Y-%m-%d", time.localtime(at))
+            if not d.get("isSidechain"):
+                lines[day] = lines.get(day, 0) + 1
+                sid = d.get("sessionId")
+                if sid and (sid not in sessions or at < sessions[sid]):
+                    sessions[sid] = at
+            m = d.get("message") if isinstance(d.get("message"), dict) else None
+            u = m and m.get("usage")
+            if u and m.get("model") != "<synthetic>":
+                usage.append([m.get("id"), d.get("requestId"), day, m.get("model", "?"),
+                              u.get("input_tokens", 0) or 0, u.get("output_tokens", 0) or 0])
+    return {"lines": lines, "sessions": sessions, "usage": usage}
+
+
+def cmd_stats(period="all"):
+    """All-time activity (or the last 30 or 7 days) as JSON: sessions, active days, peak hour, a
+    day-by-day count, and tokens per model, counted once per reply and the way Claude's card does."""
+    if period not in ("all", "30", "7"):
+        die("stats covers all, 30 or 7 (days)")
+    home = Path.home() / ".claude"
+    saved = {}
+    try:
+        saved = json.loads((home / "stats-cache.json").read_text())
+    except (OSError, ValueError):
+        pass
+    cutoff = saved.get("lastComputedDate") or ""  # days up to here are Claude's saved stats
+    files = list(home.glob("projects/*/*.jsonl")) + list(home.glob("projects/*/*/subagents/agent-*.jsonl"))
+    cache = json.loads(ACTIVITY_CACHE.read_text()) if ACTIVITY_CACHE.exists() else {}
+    since = "0000" if period == "all" else time.strftime("%Y-%m-%d", time.localtime(time.time() - (int(period) - 1) * 86400))
+    lines, first, seen = {}, {}, set()
+    check_lines, check_first = 0, {}  # Kite's own /usage checks (0 tokens), saved as sessions before 2026-09-27
+    once, claude = {}, {}  # model -> [in, out]
+    by_day_model = {}      # day -> model -> in+out, counted once
+    for path in files:
+        st = path.stat()
+        stamp = f"{st.st_mtime}:{st.st_size}"
+        if cache.get(str(path), {}).get("stamp") != stamp:
+            cache[str(path)] = {"stamp": stamp, **file_activity(path)}
+        a = cache[str(path)]
+        if path.parent.name.endswith("-agents--ping"):
+            # Not your sessions: counted apart, so the tiles are real and the card's figure still ties out.
+            check_lines += sum(n for day, n in a["lines"].items() if day > cutoff and day >= since)
+            for sid, at in a["sessions"].items():
+                check_first[sid] = at
+            continue
+        for day, n in a["lines"].items():
+            if day > cutoff and day >= since:
+                lines[day] = lines.get(day, 0) + n
+        for sid, at in a["sessions"].items():
+            if sid not in first or at < first[sid]:
+                first[sid] = at
+        for mid, rid, day, model, i, o in a["usage"]:
+            if day <= cutoff or day < since:
+                continue
+            c = claude.setdefault(model, [0, 0]); c[0] += i; c[1] += o
+            if (mid, rid) in seen:
+                continue
+            seen.add((mid, rid))
+            t = once.setdefault(model, [0, 0]); t[0] += i; t[1] += o
+            dm = by_day_model.setdefault(day, {}); dm[model] = dm.get(model, 0) + i + o
+    ACTIVITY_CACHE.write_text(json.dumps({k: v for k, v in cache.items() if Path(k).exists()}))  # speed only
+    # Claude's saved days: its own counts, in its own units (lines, and tokens its way).
+    old_days = {x["date"]: x for x in saved.get("dailyActivity", []) if x["date"] >= since}
+    for day, x in old_days.items():
+        lines[day] = lines.get(day, 0) + x.get("messageCount", 0)
+    old_tokens = {x["date"]: x.get("tokensByModel", {}) for x in saved.get("dailyModelTokens", []) if x["date"] >= since}
+    for day, tm in old_tokens.items():
+        for model, n in tm.items():
+            dm = by_day_model.setdefault(day, {}); dm[model] = dm.get(model, 0) + n
+    new_sessions = [at for at in first.values() if time.strftime("%Y-%m-%d", time.localtime(at)) > cutoff
+                    and time.strftime("%Y-%m-%d", time.localtime(at)) >= since]
+    hours = [0] * 24
+    for at in new_sessions:
+        hours[time.localtime(at).tm_hour] += 1
+    if period == "all":
+        for h, n in (saved.get("hourCounts") or {}).items():
+            hours[int(h)] += n
+    old_sessions = sum(x.get("sessionCount", 0) for x in old_days.values())
+    checks = sum(1 for at in check_first.values() if time.strftime("%Y-%m-%d", time.localtime(at)) > cutoff
+                 and time.strftime("%Y-%m-%d", time.localtime(at)) >= since)
+    saved_tokens = sum(sum(tm.values()) for tm in old_tokens.values())
+    total_once = sum(i + o for i, o in once.values()) + saved_tokens
+    total_claude = sum(i + o for i, o in claude.values()) + saved_tokens
+    models = {m: {"input": v[0], "output": v[1], "claude": sum(claude.get(m, [0, 0]))} for m, v in once.items()}
+    fav = max(models, key=lambda m: models[m]["input"] + models[m]["output"], default=None)
+    out = {
+        "period": period, "saved_until": cutoff or None,
+        "sessions": len(new_sessions) + old_sessions,
+        "messages": sum(lines.values()),                     # the card's way: transcript lines
+        "checks": checks, "check_messages": check_lines,     # Kite's /usage checks: the card counts these too
+        "active_days": len([d for d, n in lines.items() if n]),
+        "peak_hour": max(range(24), key=lambda h: hours[h]) if any(hours) else None,
+        "hours": hours,
+        "tokens_once": total_once, "tokens_claude": total_claude, "saved_tokens": saved_tokens,
+        "favorite": fav, "models": models,
+        "days": {d: {"messages": lines.get(d, 0), "tokens": by_day_model.get(d, {})} for d in sorted(set(lines) | set(by_day_model))},
+    }
+    # Tie-out: per-model and per-day tokens each add back to the total counted once.
+    per_day = sum(sum(v.values()) for v in by_day_model.values())
+    out["ties_out"] = per_day == total_once and sum(v["input"] + v["output"] for v in models.values()) + saved_tokens == total_once
+    print(json.dumps(out))
+
+
+# ---------- Commands: what Claude Code can do, including what the user added ----------
+
+DOCS = "https://code.claude.com/docs/en/"
+COMMANDS_FILE = ROOT / "data" / "claude-code.json"
+
+
+def md_clean(t):
+    t = re.sub(r"\*\*\[(Skill|Workflow)\]\([^)]*\)\.\*\*\s*", "", t)  # "**[Skill](...).**"
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)                     # links -> text
+    t = re.sub(r"<[^>]+>", "", t).replace("\\|", "|").replace("**", "")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def cmd_commands_refresh():
+    import urllib.request
+    def get(page):
+        req = urllib.request.Request(DOCS + page + ".md", headers={"User-Agent": "kite/0.1 (docs reader)"})
+        try:
+            return urllib.request.urlopen(req, timeout=30).read().decode()
+        except Exception as e:
+            die(f"couldn't fetch {page} from the docs ({e}); kept the old list")
+    commands = []
+    for line in get("commands").splitlines():
+        m = re.match(r"^\|\s*(`/.+?`)\s*\|\s*(.*?)\s*\|\s*$", line)
+        if not m or "Removed in" in m.group(2):
+            continue
+        usage = m.group(1).split("`")[1].replace("\\|", "|")
+        kind = "skill" if "[Skill]" in m.group(2) else "workflow" if "[Workflow]" in m.group(2) else "built-in"
+        commands.append({"name": usage.split()[0], "usage": usage, "kind": kind, "what": md_clean(m.group(2))})
+    actions, section = [], None
+    for line in get("keybindings").splitlines():
+        h = re.match(r"^### (.+) actions$", line)
+        if h:
+            section = h.group(1)
+            continue
+        m = re.match(r"^\|\s*`([a-zA-Z]+:[a-zA-Z]+)`\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|", line)
+        if section and m:
+            actions.append({"group": section, "action": m.group(1), "keys": md_clean(m.group(2).replace("`", "")),
+                            "what": md_clean(m.group(3))})
+    quick, section = [], None
+    for line in get("interactive-mode").splitlines():
+        h = re.match(r"^### (.+)", line)
+        if h:
+            section = h.group(1).strip()
+            continue
+        m = re.match(r"^\|\s*(`[^|]*?`[^|]*)\|\s*(.*?)\s*\|", line)
+        if section == "Quick commands" and m:
+            quick.append({"keys": md_clean(m.group(1).replace("`", "")), "what": md_clean(m.group(2))})
+    if not commands or not actions:
+        die("the docs pages didn't parse; kept the old list")
+    COMMANDS_FILE.parent.mkdir(exist_ok=True)
+    COMMANDS_FILE.write_text(json.dumps({"source": DOCS, "fetched": time.strftime("%Y-%m-%d"),
+        "commands": commands, "actions": actions, "quick": quick}, indent=1, ensure_ascii=False) + "\n")
+    print(f"{len(commands)} commands, {len(actions)} key actions, {len(quick)} quick keys from the docs")
+
+
+def frontmatter(path):
+    m = re.match(r"^---\n(.*?)\n---", path.read_text(errors="replace"), re.S)
+    out = {}
+    for line in (m.group(1).splitlines() if m else []):
+        k, _, v = line.partition(":")
+        if v.strip():
+            out[k.strip()] = v.strip().strip('"')
+    return out
+
+
+def user_commands():
+    """The user's own skills and commands, named the way Claude Code names them (docs: skills)."""
+    home = Path.home() / ".claude"
+    out = []
+    for skill in sorted((home / "skills").glob("*/SKILL.md")):  # personal skill: its folder name
+        if skill.parent.name != "synced":
+            out.append({"name": "/" + skill.parent.name, "usage": "/" + skill.parent.name, "kind": "your skill",
+                        "what": frontmatter(skill).get("description", "")})
+    for skill in sorted((home / "skills" / "synced").glob("*/*/SKILL.md")):  # from claude.ai
+        name = frontmatter(skill).get("name") or skill.parent.name
+        out.append({"name": "/" + name, "usage": f"/{name}  (or /anthropic-skills:{name})", "kind": "synced from claude.ai",
+                    "what": frontmatter(skill).get("description", "")})
+    for cmd in sorted((home / "commands").glob("**/*.md")):  # commands/a/b.md -> /a:b
+        rel = cmd.relative_to(home / "commands").with_suffix("")
+        name = "/" + ":".join(rel.parts)
+        out.append({"name": name, "usage": name, "kind": "your command", "what": frontmatter(cmd).get("description", "")})
+    return out
+
+
+def cmd_commands():
+    doc = json.loads(COMMANDS_FILE.read_text()) if COMMANDS_FILE.exists() else {"commands": [], "actions": [], "quick": []}
+    kb = Path.home() / ".claude" / "keybindings.json"
+    custom, unbound = {}, set()  # unbound: (context, key)
+    if kb.exists():
+        for block in json.loads(kb.read_text()).get("bindings", []):
+            ctx = (block.get("context") or "Global").lower()
+            for key, action in (block.get("bindings") or {}).items():
+                if action is None:
+                    unbound.add((ctx, key.lower()))
+                else:
+                    custom.setdefault(action, []).append(key)
+
+    def in_context(action, ctx):
+        # Action ids start with their context: chat:… is Chat, historySearch:… is HistorySearch, app:… is Global.
+        prefix = action.split(":")[0].lower()
+        return ctx == prefix or ctx.startswith(prefix) or (ctx == "global" and prefix == "app") \
+            or (ctx == "chat" and prefix in ("history", "voice"))
+
+    for a in doc.get("actions", []):
+        if a["action"] in custom:
+            a["keys"], a["custom"] = " or ".join(custom[a["action"]]), True
+        elif any(k == a["keys"].lower() and in_context(a["action"], c) for c, k in unbound):
+            a["keys"], a["custom"] = "(unbound by you)", True
+    mine = user_commands()
+    print(json.dumps({"fetched": doc.get("fetched", ""), "keybindings": kb.exists(),
+                      "commands": mine + doc.get("commands", []), "actions": doc.get("actions", []),
+                      "quick": doc.get("quick", [])}))
+
+
+
+
+def take(argv, flag):
+    if flag not in argv:
+        return argv, None
+    i = argv.index(flag)
+    if i + 1 >= len(argv):
+        die(f"{flag} needs a value")
+    return argv[:i] + argv[i + 2:], argv[i + 1]
+
+
+
+
+MODELS = Path.home() / ".kite" / "models.json"  # {"opus": "claude-opus-5-5", ...}: what each short name answered as, last time
+
+
+def record_model(run, result):
+    """A run on a short name (opus, sonnet, haiku, fable) notes which model answered, so Kite's
+    menus show the current version without asking anyone."""
+    alias = (run / "model").read_text().strip() if (run / "model").exists() else ""
+    used = list((result or {}).get("modelUsage") or {})
+    hit = next((u for u in used if alias and alias in u), None)
+    if alias in ("opus", "sonnet", "haiku", "fable") and hit:
+        try:
+            d = json.loads(MODELS.read_text()) if MODELS.exists() else {}
+            if d.get(alias) != hit:
+                d[alias] = hit
+                MODELS.write_text(json.dumps(d, indent=2) + "\n")
+        except (OSError, ValueError):
+            pass
+
+
+
+
+# ---------- Claude's own history: your Claude Code sessions, from ~/.claude/projects ----------
+# Read-only. What the Claude app keeps but doesn't show: every session with its title, turns,
+# tokens and the images you pasted. Kite's own agent runs are left out (they live in
+# ~/.kite/agents and have their own views).
+
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+
+def _text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _is_prompt(d):
+    """A message you typed, not a tool result or a harness note."""
+    if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+        return False
+    c = d.get("message", {}).get("content")
+    if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+        return False
+    t = _text(c).strip()
+    return bool(t) and not t.startswith("<") or (isinstance(c, list) and any(b.get("type") == "image" for b in c if isinstance(b, dict)))
+
+
+def _opener_text(d):
+    """A session Claude started (a task handed to a new session): its one opening message is a
+    harness note then Claude's instructions, so it has no prompt of yours. Those instructions, or None."""
+    if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+        return None
+    c = d.get("message", {}).get("content")
+    if not isinstance(c, list) or any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+        return None
+    t = "\n\n".join(b.get("text", "").strip() for b in c if isinstance(b, dict) and b.get("type") == "text"
+                    and not b.get("text", "").lstrip().startswith("<"))
+    return t.strip() or None
+
+
+def session_summary(path):
+    title, first, prompts, images, t0, t1 = None, None, 0, 0, None, None
+    opener = None
+    tok = {"in": 0, "out": 0, "cache_write": 0, "cache_read": 0}
+    seen = set()
+    cwd = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ty = d.get("type")
+            if ty == "custom-title":
+                title = d.get("customTitle") or d.get("title") or title
+            ts = d.get("timestamp")
+            if ts:
+                t0 = t0 or ts
+                t1 = ts
+            cwd = cwd or d.get("cwd")
+            if _is_prompt(d):
+                prompts += 1
+                c = d["message"]["content"]
+                if isinstance(c, list):
+                    images += sum(1 for b in c if isinstance(b, dict) and b.get("type") == "image")
+                if first is None:
+                    first = _text(c).strip().split("\n")[0][:140]
+            elif opener is None:
+                opener = _opener_text(d)
+            if ty == "assistant" and not d.get("isSidechain"):
+                m = d.get("message", {})
+                u = m.get("usage")
+                key = (m.get("id"), d.get("requestId"))
+                if u and m.get("model") != "<synthetic>" and key not in seen:
+                    seen.add(key)
+                    tok["in"] += u.get("input_tokens", 0) or 0
+                    tok["out"] += u.get("output_tokens", 0) or 0
+                    tok["cache_write"] += u.get("cache_creation_input_tokens", 0) or 0
+                    tok["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+    if not prompts and not opener:
+        return None
+    if not prompts:
+        first = opener.split("\n")[0][:140]
+    return {"id": path.stem, "byClaude": not prompts, "path": str(path), "project": cwd or path.parent.name, "title": title or first or path.stem,
+            "headless": title is None,  # no title from the app: a claude -p run, not a session you had
+            "first": first or "", "prompts": prompts, "images": images, "requests": len(seen),
+            "tokens": tok, "start": t0, "end": t1}
+
+
+def cmd_history(limit="60"):
+    """Your Claude Code sessions, newest first, as JSON (Kite's own agent runs left out)."""
+    files = [f for f in CLAUDE_PROJECTS.glob("*/*.jsonl") if "-kite-agents" not in f.parent.name]
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    cache_dir = Path.home() / ".kite" / "history"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    app = _app_sessions()
+    cur = _current_account()
+    # The Claude app can carry one conversation on in a new transcript file, keeping the earlier
+    # ones as priorCliSessionIds: they're pieces of that one session, not sessions of their own.
+    piece_of = {p: cli for cli, a in app.items() for p in (a.get("priorCliSessionIds") or [])}
+
+    def summary(f):
+        c = cache_dir / f"{f.stem}.json"
+        if c.exists() and c.stat().st_mtime >= f.stat().st_mtime:
+            cached = json.loads(c.read_text())
+            if cached is not None:
+                return cached
+        s = session_summary(f)
+        c.write_text(json.dumps(s))
+        return s
+
+    out = []
+    for f in files[: int(limit) * 3]:
+        if len(out) >= int(limit):
+            break
+        if f.stem in piece_of:
+            continue
+        s = summary(f)
+        # Not Kite's own runs, nor throwaway ones in temp folders (tests, scratch).
+        if s and not str(s.get("project", "")).startswith((str(Path.home() / ".kite"), "/private/tmp", "/tmp", "/var/folders")):
+            a = app.get(s.get("id"))
+            s = dict(s, archived=bool(a and a.get("isArchived")), inApp=a is not None,
+                     appTitle=(a or {}).get("title") or None,
+                     account=(a or {}).get("_account"), here=bool(a) and a["_account"] == cur,
+                     fork=bool((a or {}).get("forkedFromSessionId")))
+            if a:
+                s["headless"] = False  # the app has it: a session you had, whoever started it
+            if a and a.get("cwd"):
+                s["project"] = a["cwd"]  # moved in the Claude app: its record has the new folder, the transcript the old
+            pieces = [summary(g) for p in (a or {}).get("priorCliSessionIds") or []
+                      for g in list(CLAUDE_PROJECTS.glob(f"*/{p}.jsonl"))[:1]]
+            pieces = [x for x in pieces if x]
+            if pieces:
+                s = _joined(pieces + [s])
+            out.append(s)
+    print(json.dumps(out))
+
+
+def _joined(pieces):
+    """One session from its transcript pieces (the newest last): counts added up, turns in order."""
+    pieces = sorted(pieces[:-1], key=lambda x: x.get("start") or "") + pieces[-1:]
+    s = dict(pieces[-1])
+    for k in ("prompts", "images", "requests"):
+        s[k] = sum(x.get(k) or 0 for x in pieces)
+    s["tokens"] = {k: sum((x.get("tokens") or {}).get(k, 0) for x in pieces) for k in s["tokens"]}
+    s["start"] = min((x["start"] for x in pieces if x.get("start")), default=s.get("start"))
+    s["first"] = pieces[0].get("first") or s.get("first")
+    s["parts"] = [x["path"] for x in pieces]
+    return s
+
+
+def _app_sessions():
+    """The Claude app's session records by Claude Code id (read only; an undocumented format, so
+    anything unreadable is skipped): which sessions the app has, and which it archived. A session
+    filed under two accounts (restored) gives the signed-in account's record."""
+    cur = _current_account()
+    found = {}
+    for d in _app_records():
+        cli = d.get("cliSessionId")
+        if cli and (cli not in found or d["_account"] == cur):
+            found[cli] = d
+    return found
+
+
+APP_DIR = Path.home() / "Library" / "Application Support" / "Claude"
+
+
+def _app_records():
+    """Every Code-tab session record the Claude app keeps, with the account and org it's filed
+    under, from its path: claude-code-sessions/<account>/<org>/local_*.json. Read only."""
+    out = []
+    for f in sorted((APP_DIR / "claude-code-sessions").glob("*/*/local_*.json")):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("sessionId"):
+            out.append(dict(d, _account=f.parent.parent.name, _org=f.parent.name, _file=str(f)))
+    return out
+
+
+def _current_account():
+    """The account the Claude app is signed in to: lastKnownAccountUuid in its config.json. Only
+    that one value is picked out of the text; nothing else in the file (it holds the login) is
+    parsed, kept or passed on."""
+    try:
+        m = re.search(r'"lastKnownAccountUuid"\s*:\s*"([0-9a-f-]{36})"', (APP_DIR / "config.json").read_text())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def cmd_app_accounts():
+    """How many Code-tab sessions the Claude app files under another account and not the signed-in
+    one (its sidebar is per account, so they stop showing after a switch). Read only; bringing them
+    back is PurpleRestore's job, not Workshop's. JSON: {current, other}."""
+    cur = _current_account()
+    records = _app_records()
+    here = {d.get("cliSessionId") for d in records if d["_account"] == cur and d.get("cliSessionId")}
+    other = {d.get("cliSessionId") or d["sessionId"] for d in records
+             if d["_account"] != cur and d.get("cliSessionId") not in here}
+    print(json.dumps({"current": cur, "other": len(other)}))
+
+
+def cmd_app_sidebar():
+    """How the Claude app groups and sorts its Code sidebar (date, project, state, custom or none;
+    recency or alpha), read from its local storage (Chromium's LevelDB): an undocumented store, read
+    only. The live log first (its last record is the newest), then the compacted tables, newest
+    first. Prints {"group", "sort"}, or nothing when it can't tell."""
+    base = Path.home() / "Library" / "Application Support" / "Claude" / "Local Storage" / "leveldb"
+    def num(f):
+        return int(f.stem) if f.stem.isdigit() else 0
+    logs = sorted(base.glob("*.log"), key=num, reverse=True)
+    tables = sorted(base.glob("*.ldb"), key=num, reverse=True)
+    for f in logs + tables:
+        try:
+            raw = f.read_bytes()
+            text = raw if f.suffix == ".log" else b"".join(_ldb_blocks(raw))
+        except (OSError, ValueError, IndexError):
+            continue
+        g = re.findall(rb'"groupByByMode":\{[^}]*"code":"([a-z]+)"', text)
+        o = re.findall(rb'"sortByByMode":\{[^}]*"code":"([a-z]+)"', text)
+        if g or o:
+            print(json.dumps({"group": g[-1].decode() if g else None, "sort": o[-1].decode() if o else None}))
+            return
+
+
+def _varint(b, i):
+    n = shift = 0
+    while True:
+        c = b[i]; i += 1
+        n |= (c & 0x7F) << shift; shift += 7
+        if c < 0x80:
+            return n, i
+
+
+def _snappy(b):
+    """Snappy's raw format, decompressed (the LevelDB table blocks use it)."""
+    n, i = _varint(b, 0)
+    out = bytearray()
+    while i < len(b):
+        tag = b[i]; i += 1
+        kind = tag & 3
+        if kind == 0:
+            ln = tag >> 2
+            if ln >= 60:
+                k = ln - 59
+                ln = int.from_bytes(b[i:i + k], "little"); i += k
+            ln += 1
+            out += b[i:i + ln]; i += ln
+            continue
+        if kind == 1:
+            ln = ((tag >> 2) & 7) + 4; off = ((tag >> 5) << 8) | b[i]; i += 1
+        elif kind == 2:
+            ln = (tag >> 2) + 1; off = int.from_bytes(b[i:i + 2], "little"); i += 2
+        else:
+            ln = (tag >> 2) + 1; off = int.from_bytes(b[i:i + 4], "little"); i += 4
+        if off == 0 or off > len(out):
+            raise ValueError("bad snappy offset")
+        for _ in range(ln):
+            out.append(out[-off])
+    return bytes(out[:n])
+
+
+def _ldb_blocks(raw):
+    """A LevelDB table's data blocks, each decompressed: the footer names the index block, whose
+    entries name the data blocks (offset, size), each followed by a type byte (1 = Snappy)."""
+    def block(off, size):
+        data, kind = raw[off:off + size], raw[off + size]
+        return _snappy(data) if kind == 1 else data
+    foot = raw[-48:]
+    _, i = _varint(foot, 0); _, i = _varint(foot, i)          # the metaindex block, not needed
+    ioff, i = _varint(foot, i); isize, i = _varint(foot, i)
+    index = block(ioff, isize)
+    restarts = int.from_bytes(index[-4:], "little")
+    end = len(index) - 4 - 4 * restarts
+    i = 0
+    while i < end:
+        _, i = _varint(index, i); nonshared, i = _varint(index, i); vlen, i = _varint(index, i)
+        i += nonshared
+        off, j = _varint(index, i); size, _ = _varint(index, j)
+        i += vlen
+        yield block(off, size)
+
+
+def cmd_app_session(cli_id):
+    """The Claude app's own id for a Claude Code session (its claude://code/ links use it), read
+    from the app's session records (an undocumented format: nothing found prints nothing). "here"
+    says whether it's in the signed-in account's sidebar (a link to another account's does nothing)."""
+    d = _app_sessions().get(cli_id)
+    if d:
+        print(json.dumps({"id": d.get("sessionId"), "title": d.get("title"), "archived": d.get("isArchived"),
+                          "here": d["_account"] == _current_account()}))
+
+
+def cmd_session(*paths):
+    """One session's turns: what you asked, the first lines of each answer, tokens, and images
+    (saved as files). Several paths are the pieces of one session, oldest first. A session Claude
+    started has no prompt of yours: its opening instructions are the first turn, marked byClaude."""
+    turns = [t for p in paths for t in _session_turns(p)]
+    print(json.dumps(turns or [t for p in paths for t in _session_turns(p, opener=True)]))
+
+
+def _session_turns(path, opener=False):
+    path = Path(path)
+    img_dir = Path.home() / ".kite" / "history" / path.stem
+    turns, cur, seen, n_img = [], None, set(), 0
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            by_claude = opener and not turns and not _is_prompt(d) and _opener_text(d)
+            if _is_prompt(d) or by_claude:
+                c = d["message"]["content"]
+                imgs = []
+                if isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "image" and b.get("source", {}).get("data"):
+                            n_img += 1
+                            img_dir.mkdir(parents=True, exist_ok=True)
+                            ext = (b["source"].get("media_type") or "image/png").split("/")[-1]
+                            fp = img_dir / f"{n_img:04d}.{ext}"
+                            if not fp.exists():
+                                fp.write_bytes(base64.b64decode(b["source"]["data"]))
+                            imgs.append(str(fp))
+                cur = {"at": d.get("timestamp"), "prompt": (by_claude or _text(c).strip())[:2000], "images": imgs,
+                       "answer": "", "tools": 0, "out": 0, "in": 0, "also": [], "byClaude": bool(by_claude)}
+                turns.append(cur)
+            elif d.get("type") == "attachment" and cur is not None and (d.get("attachment") or {}).get("type") == "queued_command":
+                # A message you sent while Claude was still working: part of this turn, not a new one.
+                # Its prompt can be content blocks (text and pasted images), not just a string: the
+                # text goes in the turn, the images with the turn's own, never the raw blocks.
+                q = (d.get("attachment") or {}).get("prompt") or ""
+                if isinstance(q, list):
+                    for b in q:
+                        if isinstance(b, dict) and b.get("type") == "image" and b.get("source", {}).get("data"):
+                            n_img += 1
+                            img_dir.mkdir(parents=True, exist_ok=True)
+                            ext = (b["source"].get("media_type") or "image/png").split("/")[-1]
+                            fp = img_dir / f"{n_img:04d}.{ext}"
+                            if not fp.exists():
+                                fp.write_bytes(base64.b64decode(b["source"]["data"]))
+                            cur["images"].append(str(fp))
+                q = _text(q).strip() if not isinstance(q, str) else q.strip()
+                if q and not q.startswith("[Image"):
+                    cur["also"].append(q[:2000])
+            elif d.get("type") == "assistant" and cur is not None and not d.get("isSidechain"):
+                cur["uuid"] = d.get("uuid") or cur.get("uuid")  # the turn's last message
+                m = d.get("message", {})
+                for b in m.get("content", []) if isinstance(m.get("content"), list) else []:
+                    if b.get("type") == "text" and b.get("text", "").strip():
+                        cur["answer"] = b["text"].strip()  # the last words of the turn are its answer
+                    elif b.get("type") == "tool_use":
+                        cur["tools"] += 1
+                u = m.get("usage")
+                key = (m.get("id"), d.get("requestId"))
+                if u and key not in seen:
+                    seen.add(key)
+                    cur["out"] += u.get("output_tokens", 0) or 0
+                    cur["in"] += (u.get("input_tokens", 0) or 0) + (u.get("cache_creation_input_tokens", 0) or 0) + (u.get("cache_read_input_tokens", 0) or 0)
+    # The last turn with no answer yet, in a transcript touched in the last 15 minutes: Claude is
+    # still working on it (the answer is written at the end of a turn).
+    if turns and not turns[-1]["answer"] and time.time() - path.stat().st_mtime < 900:
+        turns[-1]["working"] = True
+    for t in turns:
+        t["answer"] = t["answer"][:60000]  # whole answers (a long table was cut off at 1,500 characters)
+    return turns
+
+
+
+
+def main(argv):
+    global RUN_MODEL, RUN_EFFORT
+    argv, RUN_MODEL = take(argv, "--model")
+    argv, RUN_EFFORT = take(argv, "--effort")
+    argv, image = take(argv, "--image")
+    argv, kind = take(argv, "--kind")
+    argv, context = take(argv, "--context")
+    argv, resume_id = take(argv, "--resume")
+    if len(argv) == 2 and argv[0] == "warm":  # a claude started ahead for one run of this agent (#254)
+        warm(argv[1], resume=resume_id)
+        return
+    if len(argv) == 3 and argv[0] == "run":
+        start(argv[1], argv[2], image=image, kind=kind, context=context)
+    elif argv == ["commands"]:
+        cmd_commands()
+    elif argv == ["commands", "refresh"]:
+        cmd_commands_refresh()
+    elif argv == ["limits"]:
+        cmd_limits()
+    elif argv and argv[0] == "usage" and len(argv) <= 2:
+        cmd_usage(*argv[1:])
+    elif argv and argv[0] == "stats" and len(argv) <= 2:
+        cmd_stats(*argv[1:])
+    elif len(argv) == 3 and argv[0] == "follow":
+        if argv[1] == "last":
+            run = next(iter(all_runs()), None) or die("no runs yet")
+            if status(run) == "working":
+                die(f"newest run {run.name} is still working; wait for it, or name a run")
+        else:
+            run = find_run(argv[1])
+        if not (run / "session_id").exists():
+            die(f"{run.name} has no session_id yet")
+        kind = kind or ((run / "kind").read_text().strip() if (run / "kind").exists() else None)
+        start(run.parent.parent.name, argv[2], resume=(run / "session_id").read_text().strip(), image=image, kind=kind,
+              context=context)
+    elif argv and argv[0] == "mode" and len(argv) <= 2:
+        cmd_mode(*argv[1:])
+    elif argv and argv[0] == "history" and len(argv) <= 2:
+        cmd_history(*argv[1:])
+    elif len(argv) >= 2 and argv[0] == "session":
+        cmd_session(*argv[1:])
+    elif argv == ["app-sidebar"]:
+        cmd_app_sidebar()
+    elif len(argv) == 2 and argv[0] == "app-session":
+        cmd_app_session(argv[1])
+    elif argv == ["app-accounts"]:
+        cmd_app_accounts()
+    elif argv == ["status"]:
+        cmd_status()
+    elif argv and argv[0] == "open" and len(argv) <= 2:
+        cmd_open(*argv[1:])
+    elif len(argv) == 2 and argv[0] == "_work":
+        work(Path(argv[1]))
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
