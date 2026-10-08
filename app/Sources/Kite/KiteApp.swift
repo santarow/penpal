@@ -160,6 +160,10 @@ struct KiteApp: App {
             let out = args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Guide.foldCheck(out: out) } }
         }
+        if let i = args.firstIndex(of: "--enhance-recent-check"), i + 1 < args.count {  // Enhance's Recent (#323)
+            let out = args[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { EnhanceHistory.check(out: out) } }
+        }
         if args.contains("--paste-target-check") {  // where a paste into Claude would go now, read-only (#319)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Paster.targetCheck() } }
         }

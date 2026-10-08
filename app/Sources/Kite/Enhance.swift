@@ -27,6 +27,7 @@ final class EnhanceModel: ObservableObject {
     @Published var note: String?      // which model answered, when it wasn't the one picked (#302)
     @Published var expanded: UUID?    // the picture shown big over the window, if any
     @Published var hovering: UUID?    // the picture under the pointer: it shows the zoom-in mark
+    var entry: String?                // this ask's place in Recent (#323), until it's sent
     private var watch: Timer?
 
     func attach(_ png: Data) {
@@ -38,6 +39,7 @@ final class EnhanceModel: ObservableObject {
         let ask = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !ask.isEmpty, !working else { return }
         working = true; since = .now; problem = nil; note = nil
+        EnhanceHistory.save(self)  // kept for Recent (#323)
         let text = Enhance.message(ask: ask, notes: shots.map(\.note))
         let picked = Enhance.picked
         // Already found missing this session: straight to the closest one, with the note.
@@ -87,6 +89,7 @@ final class EnhanceModel: ObservableObject {
         if run.status == "done", let r = run.result.map(Enhance.unwrap), !r.isEmpty {
             result = r
             Log.line("enhance: done in \(Int(Date.now.timeIntervalSince(since) * 1000))ms")
+            EnhanceHistory.save(self)
             return true
         }
         problem = run.plainProblem ?? "Your Claude didn't answer. Try again."
@@ -223,11 +226,21 @@ enum Enhance {
         b.contentTintColor = .secondaryLabelColor
         b.toolTip = "Fold"
         b.setAccessibilityLabel("Fold")
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 40, height: 28))  // the title bar's height, so it sits level with the window's buttons
-        b.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(b)
+        // Recent asks (#323), beside it: a menu of the last 20, each opened again ready to edit or send.
+        let r = NSButton(image: NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "Recent")!,
+                         target: EnhanceHistory.MenuTarget.shared, action: #selector(EnhanceHistory.MenuTarget.show(_:)))
+        r.bezelStyle = .accessoryBarAction
+        r.showsBorderOnlyWhileMouseInside = true
+        r.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        r.contentTintColor = .secondaryLabelColor
+        r.toolTip = "Recent asks"
+        r.setAccessibilityLabel("Recent asks")
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 70, height: 28))  // the title bar's height, so it sits level with the window's buttons
+        for v in [b, r] { v.translatesAutoresizingMaskIntoConstraints = false; box.addSubview(v) }
         NSLayoutConstraint.activate([b.centerYAnchor.constraint(equalTo: box.centerYAnchor), b.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -8),
-                                     b.widthAnchor.constraint(equalToConstant: 26), b.heightAnchor.constraint(equalToConstant: 22)])
+                                     b.widthAnchor.constraint(equalToConstant: 26), b.heightAnchor.constraint(equalToConstant: 22),
+                                     r.centerYAnchor.constraint(equalTo: box.centerYAnchor), r.trailingAnchor.constraint(equalTo: b.leadingAnchor, constant: -4),
+                                     r.widthAnchor.constraint(equalToConstant: 26), r.heightAnchor.constraint(equalToConstant: 22)])
         let acc = NSTitlebarAccessoryViewController()
         acc.layoutAttribute = .trailing
         acc.view = box
@@ -306,12 +319,24 @@ enum Enhance {
         let prompt = enhanced.isEmpty ? model.draft.trimmingCharacters(in: .whitespacesAndNewlines) : enhanced
         let shots = model.shots
         guard !prompt.isEmpty || !shots.isEmpty else { return }
+        EnhanceHistory.save(model)  // kept for Recent, whatever happens next (#323)
+        let text = sendText(prompt, shots.map(\.note), lines: Paster.linesBetween)
         window?.orderOut(nil); pill?.orderOut(nil)
-        Paster.pastePicturesAndText(shots.map(\.png), text: sendText(prompt, shots.map(\.note), lines: Paster.linesBetween)) { result in
-            Log.line("enhance: sent \(shots.count) pictures (\(result))")
+        // Cleared only once it's seen in Claude's box (#323, Jason: "i made a long pre-prompt, but it was not sent to claude").
+        // Otherwise everything stays here, the words go on the clipboard, and it says so.
+        Paster.pastePicturesAndText(shots.map(\.png), text: text) { sent in
+            guard sent.ok else {
+                Log.line("enhance: not sent (\(sent.why)); kept, and the words copied")
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+                model.note = "Not sent: \(sent.why) Nothing here was cleared, and the words are on the clipboard: click in Claude's message box and press ⌘V."
+                open()
+                return
+            }
+            Log.line("enhance: sent \(shots.count) pictures (\(sent.note))")
+            EnhanceHistory.save(model, sent: true)
+            Paster.continuePictures(after: shots.count)  // a picture taken next is 🖼 n+1, as if Highlight had pasted these
+            model.draft = ""; model.result = ""; model.shots = []; model.entry = nil; model.note = nil
         }
-        Paster.continuePictures(after: shots.count)  // a picture taken next is 🖼 n+1, as if Highlight had pasted these
-        model.draft = ""; model.result = ""; model.shots = []
     }
 
     // All the words in one paste: the prompt, then each picture's label and note, Lines between pictures apart.
