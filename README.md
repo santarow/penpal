@@ -14,12 +14,9 @@ A Mac app that helps you write to Claude. Made by SantaRow.
 - **Claude History:** every Claude Code session on this Mac, searchable, with resume and fork.
 - **Usage:** your plan's limits and tokens over time.
 
-## It runs on your own Claude
+## What you need
 
-Penpal has no server and no account. Guide me and Enhance run the `claude` command (Claude Code) on
-your Mac, on the account Claude Code is signed in to, and ignore API keys and API servers set in your
-Mac's environment (`ANTHROPIC_*`). If Claude Code is signed in to a Console (API) account, or has an API
-key in its own settings, that's what it uses.
+Penpal has no server and no account. Guide me and Enhance run Claude Code on your Mac.
 
 You need:
 
