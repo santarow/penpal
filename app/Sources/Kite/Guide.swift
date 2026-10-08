@@ -450,7 +450,7 @@ enum Guide {
 
     // The answer as it's written (events.jsonl, every 40 ms): each whole step line gets its ring at once.
     private static func streamSteps(_ id: String) {
-        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents/guide/runs/\(id)/events.jsonl")
+        let file = Kite.home.appendingPathComponent("agents/guide/runs/\(id)/events.jsonl")
         var offset: UInt64 = 0, carry = Data(), text = "", used = 0
         streamed = 0
         var replaced = state.steps.isEmpty  // else an instant ring is up: Claude's first step takes its place
@@ -1201,12 +1201,12 @@ enum Guide {
         let p = Process(), pipe = Pipe()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = ["run", "guide", "Goal: \(goal)", "--image", shot.path, "--context", ctx.path]
-        var env = ProcessInfo.processInfo.environment; env["PATH"] = Kite.path; p.environment = env
+        p.environment = Kite.engineEnv
         p.standardOutput = pipe
         try? p.run(); p.waitUntilExit()
         let said = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard let name = said.split(separator: " ").first?.split(separator: "/").last else { return print("kite run said: \(said)") }
-        let run = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents/guide/runs/\(name)")
+        let run = Kite.home.appendingPathComponent("agents/guide/runs/\(name)")
         let started = Date.now
         var result: String?
         while Date.now.timeIntervalSince(started) < 180 {
@@ -1529,12 +1529,12 @@ enum Guide {
         let p = Process(), pipe = Pipe()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = ["run", "guide", "Goal: \(goal)", "--image", shot.path, "--context", ctx.path]
-        var env = ProcessInfo.processInfo.environment; env["PATH"] = Kite.path; p.environment = env
+        p.environment = Kite.engineEnv
         p.standardOutput = pipe
         try? p.run(); p.waitUntilExit()
         let said = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard let name = said.split(separator: " ").first?.split(separator: "/").last else { return print("kite run said: \(said)") }
-        let run = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents/guide/runs/\(name)")
+        let run = Kite.home.appendingPathComponent("agents/guide/runs/\(name)")
         let started = Date.now
         var result: String?
         while Date.now.timeIntervalSince(started) < 180 {

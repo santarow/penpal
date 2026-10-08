@@ -17,7 +17,7 @@ struct RunState {
     var errorKind: String? = nil  // Claude Code's own word for it, e.g. model_not_found (#302)
 
     static func read(agent: String, id: String) -> RunState? {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents/\(agent)/runs/\(id)")
+        let dir = Kite.home.appendingPathComponent("agents/\(agent)/runs/\(id)")
         func text(_ f: String) -> String? {
             (try? String(contentsOf: dir.appendingPathComponent(f), encoding: .utf8)).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         }
@@ -79,8 +79,7 @@ final class WarmAgent {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = ["warm", agent] + (session.map { ["--resume", $0] } ?? []) + (picked.map { ["--model", $0] } ?? [])
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = Kite.path
+        var env = Kite.engineEnv
         p.environment = env
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
@@ -167,7 +166,7 @@ final class WarmAgent {
 @MainActor
 func timeAgents() {
     _ = NSApplication.shared
-    let src = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents/enhance/runs/20261003-081822")
+    let src = Kite.read("agents/enhance/runs/20261003-081822")
     guard let text = try? String(contentsOf: src.appendingPathComponent("input.md"), encoding: .utf8),
           let png = try? Data(contentsOf: src.appendingPathComponent("input.png")) else { return print("no input") }
     func spin(_ until: () -> Bool) { while !until() { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) } }

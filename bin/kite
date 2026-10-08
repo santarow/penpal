@@ -38,7 +38,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILTIN = ROOT / "agents"                 # agents that ship with Kite: definitions only
-AGENTS = Path(os.environ.get("KITE_AGENTS") or Path.home() / ".kite" / "agents")  # yours: every agent's runs, and your missions
+# Where your data lives (#310): KITE_HOME, which the app passes (Penpal: ~/Library/Application Support/Penpal),
+# else ~/.kite, as before (the other apps, and kite run from a terminal).
+HOME_DIR = Path(os.environ.get("KITE_HOME") or Path.home() / ".kite")
+OLD_HOME = Path.home() / ".kite"
+AGENTS = Path(os.environ.get("KITE_AGENTS") or HOME_DIR / "agents")  # yours: every agent's runs, and your missions
+
+
+def home_read(rel):
+    """A file to read: in HOME_DIR, else in ~/.kite while only it has one (one version after Penpal's move, #310)."""
+    new, old = HOME_DIR / rel, OLD_HOME / rel
+    return old if not new.exists() and old.exists() else new
 
 
 def agent_home(agent):
@@ -63,15 +73,18 @@ def find_claude():
 
 CLAUDE = find_claude()
 LENSES = ROOT / "lenses"
-USER_LENSES = Path.home() / ".kite" / "lenses"  # yours: "My lenses" at the top, other sets in subfolders
+USER_LENSES = HOME_DIR / "lenses"  # yours: "My lenses" at the top, other sets in subfolders
 
 
 def lens_sets():
     """Every lens folder, as Lenses.swift reads them: My lenses, then each set (a subfolder) by name. The repo's
     lenses/ are the defaults Penpal copies in on first load (#261); they count only until it has."""
-    subs = sorted(p for p in USER_LENSES.iterdir() if p.is_dir()) if USER_LENSES.is_dir() else []
-    yours = [USER_LENSES, *subs]
-    return yours if any(any(f.glob("*.md")) for f in yours) else [LENSES, LENSES / "fun"]
+    for home in (USER_LENSES, OLD_HOME / "lenses"):  # ~/.kite's while only it has yours (#310)
+        subs = sorted(p for p in home.iterdir() if p.is_dir()) if home.is_dir() else []
+        yours = [home, *subs]
+        if any(any(f.glob("*.md")) for f in yours):
+            return yours
+    return [LENSES, LENSES / "fun"]
 
 
 def lenses():
@@ -91,12 +104,12 @@ def lens_file(name):
     return lenses().get((name or "").strip().lower())
 
 
-MODE_FILE = Path.home() / ".kite" / "mode"
+MODE_FILE = HOME_DIR / "mode"
 
 
 def policy():
-    """The organization's policy (see Features.swift): the enforced file in /Library, else a trial one in ~/.kite."""
-    for path in (Path("/Library/Application Support/Kite/policy.json"), Path.home() / ".kite" / "policy.json"):
+    """The organization's policy (see Features.swift): the enforced file in /Library, else a trial one in your home."""
+    for path in (Path("/Library/Application Support/Kite/policy.json"), home_read("policy.json")):
         if path.exists():
             try:
                 return json.loads(path.read_text())
@@ -121,7 +134,8 @@ def allowed_tools(cfg, agent=None):
 
 
 def current_mode():
-    name = MODE_FILE.read_text().strip().lower() if MODE_FILE.exists() else ""
+    f = home_read("mode")
+    name = f.read_text().strip().lower() if f.exists() else ""
     return name if lens_file(name) else ""
 
 
@@ -438,7 +452,7 @@ def cmd_open(run_id=None):
 # ---------- Usage: tokens from ~/.claude/projects transcripts, limits from rate_limit_event ----------
 
 TYPES = ("input", "output", "cache_write", "cache_read")
-USAGE_CACHE = Path.home() / ".kite" / "usage-cache-v3.json"
+USAGE_CACHE = HOME_DIR / "usage-cache-v3.json"
 
 
 def file_usage(path):
@@ -464,7 +478,7 @@ def file_usage(path):
     return out
 
 
-LIMITS_FILE = Path.home() / ".kite" / "limits-v2.json"
+LIMITS_FILE = HOME_DIR / "limits-v2.json"
 
 
 def reset_time(text, tz):
@@ -518,7 +532,7 @@ def cmd_limits():
     LIMITS_FILE.parent.mkdir(exist_ok=True)
     LIMITS_FILE.write_text(json.dumps(info))
     # History: /usage only shows the current windows, so keep each reading that changed (or every 30 min).
-    hist = Path.home() / ".kite" / "usage" / "limits.jsonl"
+    hist = HOME_DIR / "usage" / "limits.jsonl"
     hist.parent.mkdir(parents=True, exist_ok=True)
     last = json.loads(hist.read_text().splitlines()[-1]) if hist.exists() and hist.stat().st_size else None
     point = {"at": info["at"], **{w["name"]: w["pct"] for w in windows}}
@@ -548,7 +562,7 @@ def latest_limits():
     return max((x for x in (best, saved) if x), key=lambda x: x["at"], default=None)
 
 
-USAGE_DIR = Path.home() / ".kite" / "usage"  # history lives here: /usage readings only (limits.jsonl)
+USAGE_DIR = HOME_DIR / "usage"  # history lives here: /usage readings only (limits.jsonl)
 
 
 def cmd_usage(period="7"):
@@ -627,7 +641,7 @@ def cmd_usage(period="7"):
 # that file (Claude's counting). The card's token total adds each reply once per line it's written on
 # (a reply takes ~2 lines: thinking, text, tool use); Kite shows both, from the same scan.
 
-ACTIVITY_CACHE = Path.home() / ".kite" / "activity-cache-v1.json"
+ACTIVITY_CACHE = HOME_DIR / "activity-cache-v1.json"
 
 
 def file_activity(path):
@@ -876,7 +890,7 @@ def take(argv, flag):
 
 
 
-MODELS = Path.home() / ".kite" / "models.json"  # {"opus": "claude-opus-5-5", ...}: what each short name answered as, last time
+MODELS = HOME_DIR / "models.json"  # {"opus": "claude-opus-5-5", ...}: what each short name answered as, last time
 
 
 def record_model(run, result):
@@ -990,7 +1004,7 @@ def cmd_history(limit="60"):
     """Your Claude Code sessions, newest first, as JSON (Kite's own agent runs left out)."""
     files = [f for f in CLAUDE_PROJECTS.glob("*/*.jsonl") if "-kite-agents" not in f.parent.name]
     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    cache_dir = Path.home() / ".kite" / "history"
+    cache_dir = HOME_DIR / "history"
     cache_dir.mkdir(parents=True, exist_ok=True)
     app = _app_sessions()
     cur = _current_account()
@@ -1016,7 +1030,7 @@ def cmd_history(limit="60"):
             continue
         s = summary(f)
         # Not Kite's own runs, nor throwaway ones in temp folders (tests, scratch).
-        if s and not str(s.get("project", "")).startswith((str(Path.home() / ".kite"), "/private/tmp", "/tmp", "/var/folders")):
+        if s and not str(s.get("project", "")).startswith((str(HOME_DIR), str(OLD_HOME), "/private/tmp", "/tmp", "/var/folders")):
             a = app.get(s.get("id"))
             s = dict(s, archived=bool(a and a.get("isArchived")), inApp=a is not None,
                      appTitle=(a or {}).get("title") or None,
@@ -1202,7 +1216,7 @@ def cmd_session(*paths):
 
 def _session_turns(path, opener=False):
     path = Path(path)
-    img_dir = Path.home() / ".kite" / "history" / path.stem
+    img_dir = HOME_DIR / "history" / path.stem
     turns, cur, seen, n_img = [], None, set(), 0
     with open(path, errors="replace") as f:
         for line in f:

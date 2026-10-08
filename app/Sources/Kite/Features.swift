@@ -111,7 +111,7 @@ struct Policy {
     // SantaRow's (#310); the old Kite folder is still read for one version.
     static let enforcedPath = FileManager.default.fileExists(atPath: "/Library/Application Support/SantaRow/policy.json")
         ? "/Library/Application Support/SantaRow/policy.json" : "/Library/Application Support/Kite/policy.json"
-    static let userPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/policy.json").path
+    static let userPath = Kite.read("policy.json").path
     static let shared = Policy.load()
 
     var disabled: Set<String> = []

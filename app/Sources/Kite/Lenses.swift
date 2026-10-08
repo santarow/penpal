@@ -24,7 +24,7 @@ struct LensStore {
     static let mySet = "My lenses"  // its name inside (set switches are saved by it); shown as "My snippets"
     static func title(_ set: String) -> String { set == mySet ? "My snippets" : set }
     let folder: URL  // the defaults
-    static let userRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/lenses")
+    static let userRoot = Kite.read("lenses")  // ~/.kite's while only it has yours (#310)
 
     static func locate() -> LensStore {
         if let path = (Bundle.main.object(forInfoDictionaryKey: "SantaRowLensesPath") ?? Bundle.main.object(forInfoDictionaryKey: "KiteLensesPath")) as? String,

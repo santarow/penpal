@@ -22,6 +22,53 @@ enum Kite {
         return FileManager.default.fileExists(atPath: r + "/bin/penpal") ? "bin/penpal" : "bin/kite"
     }
     static let path = "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+    // Where your data lives (#310): runs, snippets, mode, usage, Claude History's copies. Penpal keeps its own,
+    // ~/Library/Application Support/Penpal (Jason: Penpal's own folder, not a shared SantaRow one); the other
+    // apps keep ~/.kite. The engine gets it as KITE_HOME.
+    static let oldHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite")
+    static let home: URL = Flavor.current == .penpal
+        ? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Penpal")
+        : oldHome
+    // A file or folder to use: here, else in ~/.kite while only it has one (for one version after the move, #310).
+    static func read(_ path: String) -> URL {
+        let new = home.appendingPathComponent(path), old = oldHome.appendingPathComponent(path)
+        let fm = FileManager.default
+        return !fm.fileExists(atPath: new.path) && fm.fileExists(atPath: old.path) ? old : new
+    }
+    // The environment for the engine and the tools the app starts: apps don't get the shell's PATH, so it
+    // names the user's own claude and a python3; and the engine's home.
+    static var engineEnv: [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = path
+        env["KITE_HOME"] = home.path
+        return env
+    }
+
+    // Penpal's first launch after #310: what it had in ~/.kite is copied into its own folder, before anything
+    // reads it. Copied, not moved: the other apps still read ~/.kite. On APFS a copy is a clone (1 GB in about
+    // half a second, no extra space). Once: a note in the folder says when, and what came along.
+    static let moved = ["lenses", "mode", "usage", "usage-cache-v3.json", "limits-v2.json", "activity-cache-v1.json",
+                        "models.json", "policy.json", "history", "agents/enhance", "agents/guide"]
+    static func moveHome() {
+        let fm = FileManager.default
+        let note = home.appendingPathComponent("moved-from-kite.txt")
+        guard home != oldHome, !fm.fileExists(atPath: note.path) else { return }
+        try? fm.createDirectory(at: home.appendingPathComponent("agents"), withIntermediateDirectories: true)
+        var copied: [String] = [], failed: [String] = []
+        let own = oldHome.appendingPathComponent("apps/penpal")  // Penpal's own bits before #310
+        let items = moved.map { ($0, oldHome.appendingPathComponent($0)) }
+            + ((try? fm.contentsOfDirectory(atPath: own.path)) ?? []).map { ($0, own.appendingPathComponent($0)) }
+        for (name, from) in items where fm.fileExists(atPath: from.path) {
+            let to = home.appendingPathComponent(name)
+            if fm.fileExists(atPath: to.path) { continue }  // already here: never overwritten
+            do { try fm.copyItem(at: from, to: to); copied.append(name) } catch { failed.append("\(name): \(error.localizedDescription)") }
+        }
+        let text = "Copied from ~/.kite on \(Date.now.formatted(.iso8601)):\n" + copied.map { "  \($0)\n" }.joined()
+            + (failed.isEmpty ? "" : "Not copied (read from ~/.kite instead):\n" + failed.map { "  \($0)\n" }.joined())
+        try? text.write(to: note, atomically: true, encoding: .utf8)
+        Log.line("home: \(copied.count) copied from ~/.kite to \(home.path)" + (failed.isEmpty ? "" : ", \(failed.count) failed"))
+    }
 }
 
 struct Agent: Identifiable, Hashable {
@@ -171,11 +218,11 @@ final class AgentStore: ObservableObject {
     // A screenshot waiting in an agent's message box, sent with the user's next message.
     @Published var pendingImage: (agent: String, png: Data)?
     @Published var newChatRequest = 0
-    static let modeFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/mode")
+    static let modeFile = Kite.read("mode")
 
     let root: URL
     // Your data: every agent's runs and your missions. The repo's agents/ holds only built-in definitions.
-    static let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/agents")
+    static let home = Kite.home.appendingPathComponent("agents")
     static var builtin: URL {
         URL(fileURLWithPath: (Kite.root) ?? "").appendingPathComponent("agents")
     }
@@ -377,9 +424,7 @@ final class AgentStore: ObservableObject {
         let task = Process()
         task.executableURL = root.appendingPathComponent(Kite.cli)
         task.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        // Apps don't get the shell's PATH, so name the user's own claude and a python3.
-        env["PATH"] = Kite.path
+        var env = Kite.engineEnv
         if let claudePath { env["KITE_CLAUDE"] = claudePath }
         task.environment = env
         let err = Pipe()

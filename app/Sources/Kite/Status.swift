@@ -207,7 +207,7 @@ final class StatusModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = ["history", "40"]
-        var env = ProcessInfo.processInfo.environment; env["PATH"] = Kite.path; p.environment = env
+        p.environment = Kite.engineEnv
         let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return then() }
         DispatchQueue.global(qos: .userInitiated).async {

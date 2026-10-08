@@ -74,7 +74,7 @@ final class HistoryModel: ObservableObject {
     @Published var collapsed = Set(UserDefaults.standard.stringArray(forKey: "history.collapsed") ?? []) {
         didSet { UserDefaults.standard.set(Array(collapsed), forKey: "history.collapsed") }
     }
-    private static let foldersFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/history/folders.json")
+    private static let foldersFile = Kite.read("history/folders.json")
     private struct Folders: Codable { var folders: [HistoryFolder]; var sessions: [String: String] }
     func loadFolders() {
         guard let d = try? Data(contentsOf: Self.foldersFile), let f = try? JSONDecoder().decode(Folders.self, from: d) else { return }
@@ -115,7 +115,7 @@ final class HistoryModel: ObservableObject {
     @Published var pinnedTurns: [PinnedTurn] = []
     @Published var showPinnedTurns = false         // the "Pinned answers" view across sessions
     @Published var columns: NavigationSplitViewVisibility = .all  // .doubleColumn hides the sessions list
-    private static let pinsFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/history/pins.json")
+    private static let pinsFile = Kite.read("history/pins.json")
     private struct Pins: Codable { var sessions: [String]; var turns: [PinnedTurn] }
 
     func loadPins() {
@@ -271,8 +271,7 @@ final class HistoryModel: ObservableObject {
         let task = Process()
         task.executableURL = root.appendingPathComponent(Kite.cli)
         task.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = Kite.path
+        var env = Kite.engineEnv
         task.environment = env
         let out = Pipe()
         task.standardOutput = out

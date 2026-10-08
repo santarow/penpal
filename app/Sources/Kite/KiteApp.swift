@@ -47,6 +47,7 @@ struct KiteApp: App {
     // launched. Creating the voice agent here once installed its key monitors too early and
     // silently blocked every mouse click to Kite's windows (found by bisecting, 2026-09-24).
     init() {
+        Kite.moveHome()  // Penpal: its data from ~/.kite into its own folder, once, before anything reads it (#310)
         // --render <welcome|holly> <out.png>: draw that window to a picture and quit, before any
         // feature starts (for checking a screen while another copy of the app is in use).
         if CommandLine.arguments.contains("--picture-labels") {  // three labels in a row, as pasted, then quit

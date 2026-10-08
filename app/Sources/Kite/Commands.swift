@@ -81,8 +81,7 @@ final class CommandsModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = Kite.path
+        var env = Kite.engineEnv
         p.environment = env
         let out = Pipe()
         p.standardOutput = out

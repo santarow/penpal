@@ -59,7 +59,7 @@ final class UsageModel: ObservableObject {
     func load() {
         let p = tokensShown ? period : "7"
         if report == nil || report?.period != p,
-           let data = try? Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kite/usage/last-\(p).json")),
+           let data = try? Data(contentsOf: Kite.read("usage/last-\(p).json")),
            let cached = try? JSONDecoder().decode(UsageReport.self, from: data) {
             report = cached
         }
@@ -87,8 +87,7 @@ final class UsageModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
         p.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = Kite.path
+        var env = Kite.engineEnv
         p.environment = env
         let out = Pipe()
         p.standardOutput = out

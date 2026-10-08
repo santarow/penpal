@@ -58,8 +58,9 @@ ID certificate and a notary profile.
 | `lenses/` | the snippets Penpal starts with |
 | `data/claude-code.json` | Claude Code's commands and keys, for the Commands list |
 
-Runs are plain files in `~/.kite/agents/<agent>/runs/`. Penpal's own settings live in
-`~/.kite/apps/penpal/`, and its log in `~/Library/Logs/Penpal/`.
+Your data lives in `~/Library/Application Support/Penpal/`: snippets, usage, Claude History's copies, and
+each run as plain files in `agents/<agent>/runs/`. The log is in `~/Library/Logs/Penpal/`. The engine
+takes that folder as `KITE_HOME` (without it, `~/.kite`).
 
 ## License
 
