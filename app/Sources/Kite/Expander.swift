@@ -71,7 +71,7 @@ final class Expander: ObservableObject {
     }
 
     private func expand(_ name: String, typed: Int) {
-        guard let text = lenses.expansion(name) else { return }
-        Paster.paste(text, deleting: typed)  // the abbreviation you just typed
+        guard let text = lenses.expansion(name), let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+        Paster.paste(text, deleting: typed, into: pid)  // the abbreviation you just typed, only there (#319)
     }
 }

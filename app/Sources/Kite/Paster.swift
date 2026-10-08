@@ -5,11 +5,15 @@ import ApplicationServices
 // Never presses Enter: the user sends the message.
 @MainActor
 enum Paster {
-    static func paste(_ text: String, deleting count: Int = 0) {
+    // A snippet (#319): only into the app it was typed in, still in front, and in Claude only into its message box.
+    // Otherwise nothing is deleted or typed.
+    static func paste(_ text: String, deleting count: Int = 0, into pid: pid_t) {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return Log.line("snippet: its app isn't in front, nothing typed") }
+        guard let f = focusedElement(pid), isPrompt(f) else { return Log.line("snippet: not in Claude's message box (\(describe(focusedElement(pid)))), nothing typed") }
         paste(deleting: count) { $0.setString(text, forType: .string) }
     }
 
-    static func paste(deleting count: Int = 0, write: (NSPasteboard) -> Void) {
+    private static func paste(deleting count: Int = 0, write: (NSPasteboard) -> Void) {
         let source = CGEventSource(stateID: .combinedSessionState)
         for _ in 0..<count { press(51, source) }  // delete
 
@@ -111,15 +115,11 @@ enum Paster {
                 Log.line("prompt box: \(refocused)")
                 if refocused != "already focused" { wait = 0.1 }  // let the web view move focus first
             }
-            @MainActor func pasteNow() {
-                if pressMenuPaste(pid) { Log.line("pressed Edit > Paste") }
-                else { Log.line("no Paste menu item, sent ⌘V"); press(9, CGEventSource(stateID: .combinedSessionState), flags: .maskCommand) }
-            }
+            @MainActor func pasteNow() -> Bool { pasteInto(pid, claude: isClaude) }
             @MainActor func pasteIt() {
                 board.clearContents(); write(board)
                 let ours = board.changeCount
-                pasteNow()
-                restore(board, saved, ifStill: ours)
+                if pasteNow() { restore(board, saved, ifStill: ours) } else { leftOnClipboard(what, claude: isClaude) }
             }
             guard let label else {
                 return DispatchQueue.main.asyncAfter(deadline: .now() + wait) { MainActor.assumeIsolated { pasteIt(); took(what) } }
@@ -130,7 +130,7 @@ enum Paster {
             let before = isClaude ? promptText(pid) : nil
             @MainActor func pasteLabel(try n: Int) {
                 board.clearContents(); board.setString(label, forType: .string)
-                pasteNow()
+                guard pasteNow() else { return pasteIt() }  // nowhere safe to type: the picture waits on the clipboard
                 let sent = Date.now
                 @MainActor func check() {
                     let gone = Date.now.timeIntervalSince(sent)
@@ -205,10 +205,15 @@ enum Paster {
             guard let app else { return done("Claude isn't running") }
             guard AXIsProcessTrusted() else { return done("needs \(Permissions.controlName)") }
             let pid = app.processIdentifier, board = NSPasteboard.general, saved = save(board)
-            if Expander.claudeApps.contains(app.bundleIdentifier ?? "") { _ = focusPrompt(pid) }
+            let isClaude = Expander.claudeApps.contains(app.bundleIdentifier ?? "")
+            if isClaude { _ = focusPrompt(pid) }
+            guard !isClaude || (focusedElement(pid).map(isPrompt) ?? false) else {
+                Log.line("send: Claude's message box not found, nothing typed")
+                return done("couldn't find Claude's message box")
+            }
             @MainActor func paste(_ write: (NSPasteboard) -> Void) {
                 board.clearContents(); write(board)
-                if !pressMenuPaste(pid) { press(9, CGEventSource(stateID: .combinedSessionState), flags: .maskCommand) }
+                _ = pasteInto(pid, claude: isClaude)
             }
             var had: String?
             let io = SendIO(
@@ -330,36 +335,75 @@ enum Paster {
     private static var lastPrompt: AXUIElement?
 
     private static func focusPrompt(_ pid: pid_t) -> String {
-        if let now = focusedElement(pid), attr(now, "AXRole") as? String == "AXTextArea" {
+        if let now = focusedElement(pid), isPrompt(now) {
             lastPrompt = now
             return "already focused"
         }
-        if let box = lastPrompt, attr(box, "AXRole") as? String == "AXTextArea",
+        if let box = lastPrompt, isPrompt(box),
            AXUIElementSetAttributeValue(box, "AXFocused" as CFString, kCFBooleanTrue) == .success {
             return "focus restored"
         }
         guard let window = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") else { return "no window" }
-        guard let box = findPrompt(in: window as! AXUIElement) else { return "not found, pasting anyway" }
+        guard let box = findPrompt(in: window as! AXUIElement) else { return "not found" }
         lastPrompt = box
         return AXUIElementSetAttributeValue(box, "AXFocused" as CFString, kCFBooleanTrue) == .success
             ? "found and focused" : "found, could not focus"
     }
 
-    // Breadth-first, skipping the message list, capped so a long chat can't stall it.
-    // Prefers the text area labelled "Prompt"; else the first text area seen.
+    // Breadth-first, skipping the message list, capped so a long chat can't stall it. Only Claude's message box:
+    // never the first text area seen, which can be a file open in the Code tab (#319).
     private static func findPrompt(in root: AXUIElement) -> AXUIElement? {
-        var queue = [root], seen = 0, first: AXUIElement?
+        var queue = [root], seen = 0
         while !queue.isEmpty, seen < 5000 {
             let e = queue.removeFirst()
             seen += 1
-            if attr(e, "AXRole") as? String == "AXTextArea" {
-                if attr(e, "AXDescription") as? String == "Prompt" { return e }
-                first = first ?? e
-            }
+            if isPrompt(e) { return e }
             if attr(e, "AXDescription") as? String == "Chat messages" { continue }
             queue += (attr(e, "AXChildren") as? [AXUIElement]) ?? []
         }
-        return first
+        return nil
+    }
+
+    // Claude's message box: a text area named as the prompt ("Prompt" in a chat, "Write your prompt to Claude" in Code).
+    // A file's editor ("File contents") or an unnamed box isn't it (#319: "🖼 1 " went into a .sql file open in Claude).
+    static func isPrompt(_ e: AXUIElement) -> Bool {
+        guard attr(e, "AXRole") as? String == "AXTextArea" else { return false }
+        return ["AXDescription", "AXTitle", "AXPlaceholderValue"].contains { (attr(e, $0) as? String)?.lowercased().contains("prompt") == true }
+    }
+
+    // Pastes only where it was meant to go (#319): in Claude only its message box; anywhere only the chosen app, by its own
+    // Edit > Paste, or ⌘V while that app is in front. False when it can't: nothing is typed anywhere.
+    private static func pasteInto(_ pid: pid_t, claude: Bool) -> Bool {
+        if claude, !(focusedElement(pid).map(isPrompt) ?? false) {
+            Log.line("paste: focus isn't Claude's message box (\(describe(focusedElement(pid)))), nothing typed")
+            return false
+        }
+        if pressMenuPaste(pid) { Log.line("pressed Edit > Paste"); return true }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+            Log.line("paste: the app isn't in front, no ⌘V, nothing typed")
+            return false
+        }
+        Log.line("no Paste menu item, sent ⌘V")
+        press(9, CGEventSource(stateID: .combinedSessionState), flags: .maskCommand)
+        return true
+    }
+    // --paste-target-check (#319): where a paste into Claude would go now, read-only (nothing focused, typed or clicked).
+    static func targetCheck() {
+        guard let claude = claudeApp else { print("Claude isn't running"); exit(1) }
+        let pid = claude.processIdentifier
+        let focus = focusedElement(pid)
+        print("focus in Claude: \(describe(focus)) -> \(focus.map(isPrompt) == true ? "its message box: would paste" : "not its message box: would not type")")
+        if let w = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") {
+            let box = findPrompt(in: w as! AXUIElement)
+            print("message box in its window: \(box.map(describe) ?? "none found: the picture would wait on the clipboard")")
+        }
+        exit(0)
+    }
+    // When it couldn't paste: it stays on the clipboard (not put back), and you're told.
+    private static func leftOnClipboard(_ what: String, claude: Bool) {
+        NSSound(named: "Pop")?.play()
+        Notice.show(claude ? "Copied. Click in Claude's message box and press ⌘V." : "Copied. Press ⌘V where you want it.")
+        Log.line("\(what) left on the clipboard: nowhere safe to paste")
     }
 
     private static func attr(_ e: AXUIElement, _ name: String) -> CFTypeRef? {

@@ -9,8 +9,9 @@ if [ -n "$RELEASE" ]; then FLAGS="-Xswiftc -DKITE_RELEASE"; else FLAGS=""; fi
 FLAVOR="${FLAVOR:-penpal}"; ICON_BG=""
 case "$FLAVOR" in
     penpal)
-        # Penpal by SantaRow 1.0 (#266), its own numbering; 1.0.1 (#290); 1.0.2 (#298); 1.0.3 (#304); 1.0.4 (#309); 1.0.5
-        if [ -n "$RELEASE" ]; then VERSION="1.0.5"; NAME="Penpal"; SHOWN="Penpal"; ID="com.santarow.penpal"
+        # Penpal by SantaRow 1.0 (#266), its own numbering; 1.0.1 (#290); 1.0.2 (#298); 1.0.3 (#304); 1.0.4 (#309); 1.0.5;
+        # 1.0.6, the last planned (#322)
+        if [ -n "$RELEASE" ]; then VERSION="1.0.6"; NAME="Penpal"; SHOWN="Penpal"; ID="com.santarow.penpal"
         else VERSION="0.1"; NAME="Penpal Dev"; SHOWN="Penpal Dev"; ID="dev.santarow.penpal"; fi
         EXE="Penpal" ;;
     *) echo "FLAVOR must be workshop, teamforce or penpal" >&2; exit 1 ;;

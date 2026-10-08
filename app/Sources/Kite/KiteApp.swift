@@ -160,6 +160,16 @@ struct KiteApp: App {
             let out = args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Guide.foldCheck(out: out) } }
         }
+        if args.contains("--paste-target-check") {  // where a paste into Claude would go now, read-only (#319)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Paster.targetCheck() } }
+        }
+        if args.contains("--guide-read-check") {  // what a look reads, counted per window (#263)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Guide.readCheck() } }
+        }
+        if let i = args.firstIndex(of: "--guide-dns-check"), i + 1 < args.count {  // the domain demo's two looks, read-only (#263)
+            let out = args[i + 1]
+            DispatchQueue.global().async { DispatchQueue.main.async { MainActor.assumeIsolated { Guide.dnsCheck(out: out) } } }
+        }
         if let i = args.firstIndex(of: "--guide-ask-check"), i + 5 < args.count {  // a question folded into Guide me's steps (#306)
             let a = args
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { MainActor.assumeIsolated { Guide.askCheck(bundle: a[i + 1], goal: a[i + 2], question: a[i + 3], out: a[i + 4], done: Int(a[i + 5]) ?? 0) } }
@@ -738,6 +748,16 @@ struct SettingsView: View {
         }
         if Features.on(.guide) {
             GuideSeesView()
+            Section {
+                // Whole screen unless you say (#263): Jason ran Vercel and Porkbun side by side.
+                Toggle("Only the app in front", isOn: Binding(get: { let _ = labsState.version; return Guide.frontOnly },
+                                                              set: { UserDefaults.standard.set($0, forKey: Guide.frontOnlyKey); labsState.version += 1 }))
+            } header: {
+                Text("What it reads")
+            } footer: {
+                Text("Off: every window you can see, so steps can point at two windows side by side. On: only the app in front, a little faster.")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
             Section {
                 Picker("Colour", selection: ringSetting(RingStyle.colorKey, "red")) {
                     ForEach(RingStyle.colors, id: \.key) { c in

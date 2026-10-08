@@ -16,6 +16,7 @@ struct GuideControl: @unchecked Sendable {  // AXUIElement is a thread-safe CF r
     let label: String
     let frame: CGRect  // Accessibility coordinates: points from the top-left of the main screen
     var element: AXUIElement? = nil  // to find it again when it moves or grows (#250, Nike's search box)
+    var window: String? = nil  // a window behind the front one ("Safari: Porkbun"), when Guide me reads the whole screen (#263)
 }
 
 // One step on the screen: what to do, and the control it's on (nil when it isn't on screen).
@@ -43,7 +44,7 @@ struct GuideStep: Identifiable {
               ["type", "enter", "paste"].contains(s[..<colon.lowerBound].trimmingCharacters(in: .whitespaces).lowercased()) else { return nil }
         var v = String(s[colon.upperBound...]).trimmingCharacters(in: .whitespaces)
         for tail in [#",?\s+(and\s+)?then\s+(press|hit)\s+(enter|return)\.?$"#, #",?\s+and\s+(press|hit)\s+(enter|return)\.?$"#,
-                     #"\s+(in|into)\s+the\s+[\w\s]*?(box|field|bar)\.?$"#] {
+                     #"\s+(in|into)\s+the\s+[^,:]{0,40}?(box|field|bar)\.?$"#] {  // "in the Answer / Value box" too (#263)
             if let r = v.range(of: tail, options: [.regularExpression, .caseInsensitive]) { v.removeSubrange(r) }
         }
         for (o, c) in [("\"", "\""), ("“", "”"), ("'", "'"), ("‘", "’")] where v.count >= 2 && v.hasPrefix(o) && v.hasSuffix(c) {
@@ -125,6 +126,7 @@ enum Guide {
         WarmAgent.guide.prepare()  // a claude ready while you type the goal (#254)
         let app = frontApp()
         state = GuideState()
+        seenBefore = ""
         state.appName = app?.localizedName ?? "this app"
         let p = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 90), styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
@@ -157,19 +159,18 @@ enum Guide {
     // Penpal's own windows left out, so nothing has to hide); the answer comes one step per line and each
     // step gets its ring as it arrives; and a plain "click X" rings X from the control list at once.
 
-    private struct Look { let pid: pid_t; let at: Date; let window: CGRect; let found: [GuideControl]; let png: Data?; let title: String? }
+    private struct Look { let pid: pid_t; let at: Date; let window: CGRect; let found: [GuideControl]; let png: Data?; let title: String?; let titles: Set<String> }
     private static var pre: Look?
 
     private static func prefetch(_ pid: pid_t) {
         let ours = ourFrames(), shown = shownArea(), t0 = Date.now
         pre = nil
         DispatchQueue.global(qos: .userInitiated).async {
-            let (window, inApp) = read(pid, under: ours)
-            let found = inApp + aroundScreen(after: inApp.count, shown: shown)
+            let (window, found, titles) = readScreen(pid, under: ours, shown: shown)
             DispatchQueue.main.async { MainActor.assumeIsolated {
                 guard let window, window.width > 10 else { return }
                 snap(screenRect(around: window)) { png in
-                    pre = Look(pid: pid, at: .now, window: window, found: found, png: png, title: windowTitle(pid))
+                    pre = Look(pid: pid, at: .now, window: window, found: found, png: png, title: windowTitle(pid), titles: titles)
                     Log.line("guide: screen read ahead in \(Int(Date.now.timeIntervalSince(t0) * 1000))ms (\(found.count) controls, picture \((png?.count ?? 0) / 1024) KB)")
                 }
             } }
@@ -267,12 +268,11 @@ enum Guide {
         guard let app = frontApp() else { return answered(nil, "There's no app in front to look at.") }
         let pid = app.processIdentifier, ours = ourFrames(), shown = shownArea()
         DispatchQueue.global(qos: .userInitiated).async {
-            let (window, inApp) = read(pid, under: ours)
-            let found = inApp + aroundScreen(after: inApp.count, shown: shown)
+            let (window, found, _) = readScreen(pid, under: ours, shown: shown)
             DispatchQueue.main.async { MainActor.assumeIsolated {
                 guard state.answering else { return }  // closed meanwhile
                 guard let window, window.width > 10 else { return answered(nil, "\(AppName.shown) can't see a window in \(state.appName).") }
-                controls = found
+                controls = found; remember(found)
                 let screen = screenRect(around: window)
                 snap(screen) { png in
                     WarmAgent.start(.guide, questionText(q), png: png, context: describe(window, screen, found), follow: state.runID) { id in
@@ -325,18 +325,30 @@ enum Guide {
         if state.steps.isEmpty { state.phase = .failed; state.say = state.answer ?? "No steps for that." }
         showRings(); watchForYou(); showBubble()
     }
-    // A Type step's web address that's nowhere in what you asked, the goal or the screen: a guess, so never typed (#306: it
-    // once made up a /terms page). Returns what the step is about ("the terms of service box"), else nil.
+    // A Type step's web address that's nowhere in what you asked, the goal or the screens of this guide: a guess, so never
+    // typed (#306: it once made up a /terms page). Returns what the step is about ("the terms of service box"), else nil.
+    // An earlier screen counts (#263): what Vercel showed is typed on Porkbun's page.
     static func madeUp(_ say: String) -> String? {
         let probe = GuideStep(id: 0, say: say, target: nil, role: "", kind: .type)
         guard let v = probe.value?.lowercased(), v.contains("://") || v.hasPrefix("www.") || v.range(of: #"\.[a-z]{2,}/"#, options: .regularExpression) != nil else { return nil }
         let bare = v.replacingOccurrences(of: "https://", with: "").replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "www.", with: "")
-        let seen = ([lastQuestion, state.goal] + controls.map(\.label)).joined(separator: " ").lowercased()
+        let seen = ([lastQuestion, state.goal, seenBefore] + controls.map(\.label)).joined(separator: " ").lowercased()
         if seen.contains(bare) { return nil }
         if let r = say.range(of: #"\s(in|into)\s+(the\s+)?.+$"#, options: .regularExpression) {
             return String(say[r]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: #"^(in|into)\s+"#, with: "", options: .regularExpression)
         }
         return "this box"
+    }
+    // What every look of this guide has seen, so a value from an earlier screen (another tab, window or app) counts as seen.
+    static var seenBefore = ""
+    static func remember(_ found: [GuideControl]) {
+        seenBefore = String((seenBefore + " " + found.map(\.label).joined(separator: " ")).suffix(20_000))
+    }
+    // A step that goes to another tab or window ("Click the Porkbun tab", "Switch to the Vercel window"): what comes after
+    // it is on a page not in front yet, so no ring could find it (#263, as an app switch, #308).
+    static func switchesView(_ say: String) -> Bool {
+        say.range(of: #"^\s*(click|switch to|switch back to|go to|go back to|open)\b.*\b(tab|window)\b"#,
+                  options: [.regularExpression, .caseInsensitive]) != nil
     }
     // "Then: …", once: the guide sometimes starts its own text with "Then".
     static func afterLine(_ after: String) -> String {
@@ -388,7 +400,7 @@ enum Guide {
         state.appName = app.localizedName ?? state.appName
         if first, let p = freshPrefetch(app.processIdentifier) {  // read while you typed: straight to Claude
             Log.line("guide: using the screen read ahead \(Int(Date.now.timeIntervalSince(p.at) * 1000))ms ago")
-            lookedAt = (p.pid, p.title)
+            lookedAt = (p.pid, p.title); lookedTitles = p.titles
             let quick = instantSteps(state.goal, p.found)
             if let c = quick.first {  // ringed before Claude answers
                 state.steps = [GuideStep(id: state.count + 1, say: c.label, target: c.frame, role: c.role, control: c.n)]
@@ -404,20 +416,20 @@ enum Guide {
         let pid = app.processIdentifier, ours = ourFrames(), shown = shownArea()
         let t0 = Date.now
         DispatchQueue.global(qos: .userInitiated).async {
-            let (window, inApp) = read(pid, under: ours)
-            let found = inApp + aroundScreen(after: inApp.count, shown: shown)
+            let (window, found, titles) = readScreen(pid, under: ours, shown: shown)
             DispatchQueue.main.async { MainActor.assumeIsolated {
-                Log.line("guide: read \(found.count) controls in \(Int(Date.now.timeIntervalSince(t0) * 1000))ms")
+                Log.line("guide: read \(found.count) controls in \(Int(Date.now.timeIntervalSince(t0) * 1000))ms"
+                         + (titles.count > 1 ? " from \(titles.count) windows" : ""))
                 guard state.phase == .looking else { return }  // closed meanwhile
                 guard let window, window.width > 10 else { return fail("\(AppName.shown) can't see a window in \(state.appName).") }
-                lookedAt = (pid, windowTitle(pid))
+                lookedAt = (pid, windowTitle(pid)); lookedTitles = titles
                 ask(first: first, note: note, changed: changed, window: window, found: found)
             } }
         }
     }
 
     private static func ask(first: Bool, note: String?, changed: Bool = false, window: CGRect, found: [GuideControl], png ready: Data?? = nil) {
-        controls = found
+        controls = found; remember(found)
         let screen = screenRect(around: window)
         let context = describe(window, screen, found)
         let goal = first && note != nil ? "Goal: \(state.goal). More from me: \(note!)" : "Goal: \(state.goal)"
@@ -492,6 +504,9 @@ enum Guide {
         // After a step that switches app (a Dock icon), the rest is in an app not on screen yet: no ring could find it
         // (#308, Jason: "didnt highlight or check off the address bar"). The next look, in that app, gives those steps.
         if let last = state.steps.last, !last.done, last.role == "dockitem" { return Log.line("guide: steps after an app switch wait for the next look") }
+        if let last = state.steps.last, !last.done, last.kind == .click, switchesView(last.say) {
+            return Log.line("guide: steps after a tab or window switch wait for the next look")
+        }
         let control = target.flatMap { n in controls.first { $0.n == n } }
         let (k, thenEnter) = GuideStep.kind(say, given: kind)
         // "Click the address bar" then "Type: …" on the same box is one step (#308): the typing step takes its place.
@@ -524,10 +539,12 @@ enum Guide {
     private static func describe(_ window: CGRect, _ screen: CGRect, _ found: [GuideControl]) -> String {
         let list = found.map { c in
             "\(c.n). \(c.role) \"\(c.label)\" at \(Int(c.frame.minX)),\(Int(c.frame.minY)) size \(Int(c.frame.width))x\(Int(c.frame.height))"
+                + (c.window.map { " in the window behind, \"\($0)\"" } ?? "")
         }.joined(separator: "\n")
         return "The picture is the whole screen, at \(Int(screen.minX)),\(Int(screen.minY)) size \(Int(screen.width))x\(Int(screen.height)).\n"
             + "App in front: \(state.appName). Its window at \(Int(window.minX)),\(Int(window.minY)) size \(Int(window.width))x\(Int(window.height)).\n"
             + "Controls (number, role, label, position in points from the top-left of the main screen): the app's window and menu bar, "
+            + (found.contains { $0.window != nil } ? "then the other windows you can see (each named), " : "")
             + "then the Dock's icons (dockitem) and the menu bar's icons (menuextra, with the app they belong to):\n" + list
     }
 
@@ -750,6 +767,7 @@ enum Guide {
     // as the panel promises (#250: Nike's search box grew when clicked, and the results page never got a look).
     private static var follow: Timer?
     private static var lookedAt: (pid: pid_t, title: String?)?
+    private static var lookedTitles: Set<String> = []
     private static func windowTitle(_ pid: pid_t) -> String? {
         func attr(_ e: AXUIElement, _ k: String) -> CFTypeRef? { var v: CFTypeRef?; AXUIElementCopyAttributeValue(e, k as CFString, &v); return v }
         let app = AXUIElementCreateApplication(pid)
@@ -764,8 +782,14 @@ enum Guide {
     }
     private static func followTick() {
         guard state.phase == .showing else { return }
-        if let at = lookedAt, let now = windowTitle(at.pid), let was = at.title, now != was {
+        if frontOnly, let at = lookedAt, let now = windowTitle(at.pid), let was = at.title, now != was {
             Log.line("guide: the page changed, looking again")
+            lookedAt = nil
+            return look(first: state.runID == nil, changed: true)
+        }
+        // Whole screen: a click between the windows it read is no change; a page none of them showed is (#263).
+        if !frontOnly, lookedAt != nil, let front = frontApp(), let now = windowTitle(front.processIdentifier), !lookedTitles.contains(now) {
+            Log.line("guide: a new page in front, looking again")
             lookedAt = nil
             return look(first: state.runID == nil, changed: true)
         }
@@ -894,7 +918,7 @@ enum Guide {
     nonisolated static let inputs: Set<String> = ["textfield", "searchfield", "textarea", "combobox"]
 
     // The focused window's controls, plus the menu bar, numbered. Capped so a huge window can't stall it.
-    nonisolated static func read(_ pid: pid_t, under ours: [CGRect] = [], windowOnly: Bool = false) -> (CGRect?, [GuideControl]) {
+    nonisolated static func read(_ pid: pid_t, under ours: [CGRect] = [], windowOnly: Bool = false, pick: CGRect? = nil, limit: Int = 200) -> (CGRect?, [GuideControl]) {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 1.5)
         func attr(_ e: AXUIElement, _ n: String) -> CFTypeRef? {
@@ -969,10 +993,14 @@ enum Guide {
             let r = role.replacingOccurrences(of: "AX", with: "").lowercased()
             out.append(GuideControl(n: out.count + 1, role: r, label: String(label.prefix(60)), frame: f, element: e))
         }
-        if let bar = attr(app, "AXMenuBar") {
+        if pick == nil, let bar = attr(app, "AXMenuBar") {  // a window behind: its app's menu bar isn't showing
             for item in (attr(bar as! AXUIElement, "AXChildren") as? [AXUIElement] ?? []).dropFirst() { add(item, "AXMenuBarItem") }
         }
-        guard let win = attr(app, "AXFocusedWindow") ?? (attr(app, "AXWindows") as? [AXUIElement])?.first else { return (nil, out) }
+        let picked = pick.flatMap { want in (attr(app, "AXWindows") as? [AXUIElement] ?? []).first { w in
+            frame(w).map { abs($0.minX - want.minX) + abs($0.minY - want.minY) + abs($0.width - want.width) + abs($0.height - want.height) < 8 } ?? false
+        } }
+        if pick != nil && picked == nil { return (nil, []) }
+        guard let win = picked ?? attr(app, "AXFocusedWindow") ?? (attr(app, "AXWindows") as? [AXUIElement])?.first else { return (nil, out) }
         let window = win as! AXUIElement
         if windowOnly { return (frame(window), []) }  // just where the window is (has the screen moved?)
         area = frame(window).map { $0.width * $0.height } ?? .infinity
@@ -995,14 +1023,81 @@ enum Guide {
             }
             queue += kids
         }
-        // At most 200, but every text box stays: typing is often the step (e.g. Claude's message box).
-        var keep = 200 - out.filter { inputs.contains($0.role) }.count
+        // At most 200 (fewer for a window behind), but every text box stays: typing is often the step (e.g. Claude's message box).
+        var keep = limit - out.filter { inputs.contains($0.role) }.count
         let trimmed = out.filter { c in
             if inputs.contains(c.role) { return true }
             keep -= 1
             return keep >= 0
         }
         return (frame(window), trimmed.enumerated().map { GuideControl(n: $0.offset + 1, role: $0.element.role, label: $0.element.label, frame: $0.element.frame, element: $0.element.element) })
+    }
+
+    // What a look reads (#263, Jason: Guide me should "look at and ring the whole screen by default", so Vercel and Porkbun
+    // side by side both get rings): the front app's window and menu bar; then, unless Settings › Guide me says front app
+    // only, up to three other windows you can see, front to back, without the controls a window above covers; then the
+    // Dock's and menu bar's icons. Also the titles of the windows read, to tell a new page from a click between them.
+    nonisolated static let frontOnlyKey = "guide.frontOnly"
+    nonisolated static var frontOnly: Bool { UserDefaults.standard.bool(forKey: frontOnlyKey) }
+    nonisolated static func readScreen(_ pid: pid_t, under ours: [CGRect], shown: CGRect) -> (window: CGRect?, found: [GuideControl], titles: Set<String>) {
+        let (window, inApp) = read(pid, under: ours)
+        var found = inApp, titles = Set([title(pid, nil)].compactMap { $0 })
+        if !frontOnly, let window {
+            let me = ProcessInfo.processInfo.processIdentifier
+            let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            var above: [CGRect] = [], others = 0  // the list is front to back
+            for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
+                guard let owner = w[kCGWindowOwnerPID as String] as? pid_t, owner != me,
+                      let b = w[kCGWindowBounds as String], let f = CGRect(dictionaryRepresentation: b as! CFDictionary) else { continue }
+                defer { above.append(f) }
+                let isFront = owner == pid && abs(f.minX - window.minX) + abs(f.minY - window.minY) + abs(f.width - window.width) < 8
+                guard !isFront, others < 3, f.width >= 200, f.height >= 150, f.intersects(shown) else { continue }
+                let (wf, cs) = read(owner, under: ours, pick: f, limit: 100)
+                let shownHere = cs.filter { c in !above.contains { $0.contains(CGPoint(x: c.frame.midX, y: c.frame.midY)) } }
+                guard wf != nil, !shownHere.isEmpty else { continue }
+                others += 1
+                let app = NSRunningApplication(processIdentifier: owner)?.localizedName ?? "an app", t = title(owner, f)
+                if let t { titles.insert(t) }
+                let name = t.map { "\(app): \(String($0.prefix(50)))" } ?? app
+                found += shownHere.map { c in
+                    GuideControl(n: 0, role: c.role, label: c.label, frame: c.frame, element: c.element, window: name)  // numbered below
+                }
+            }
+        }
+        found = found.enumerated().map { i, c in GuideControl(n: i + 1, role: c.role, label: c.label, frame: c.frame, element: c.element, window: c.window) }
+        return (window, found + aroundScreen(after: found.count, shown: shown), titles)
+    }
+    // --guide-read-check (#263): what a look reads on this screen, counted per window (app names only, no titles or
+    // labels), whole screen and front app only, with the time each took. Read-only, nothing sent anywhere.
+    static func readCheck() {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return print("no app in front") }
+        for only in [false, true] {
+            UserDefaults.standard.set(only, forKey: frontOnlyKey)
+            let t = Date.now
+            let r = readScreen(app.processIdentifier, under: [], shown: shownArea())
+            let byWindow = Dictionary(grouping: r.found.filter { $0.role != "dockitem" && $0.role != "menuextra" }) { $0.window.map { String($0.split(separator: ":").first ?? "") + " (behind)" } ?? "\(app.localizedName ?? "front") (front)" }
+            print("\(only ? "front app only" : "whole screen"): \(r.found.count) controls in \(Int(Date.now.timeIntervalSince(t) * 1000))ms, \(r.titles.count) window title(s)")
+            for (k, v) in byWindow.sorted(by: { $0.value.count > $1.value.count }) { print("  \(k): \(v.count)") }
+            let hidden = r.found.filter { c in c.window != nil && r.found.contains { $0.window == nil && $0.role != "dockitem" && $0.role != "menuextra" && r.window?.contains(CGPoint(x: c.frame.midX, y: c.frame.midY)) == true } }
+            print("  behind-window controls under the front window: \(hidden.count)")
+        }
+        UserDefaults.standard.removeObject(forKey: frontOnlyKey)
+        exit(0)
+    }
+    // A window's title: the focused one's, or the one at that place.
+    nonisolated static func title(_ pid: pid_t, _ at: CGRect?) -> String? {
+        func attr(_ e: AXUIElement, _ k: String) -> CFTypeRef? { var v: CFTypeRef?; AXUIElementCopyAttributeValue(e, k as CFString, &v); return v }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        let w: AXUIElement?
+        if let at {
+            w = (attr(app, "AXWindows") as? [AXUIElement] ?? []).first { e in
+                guard let p = attr(e, "AXPosition") else { return false }
+                var pt = CGPoint.zero; AXValueGetValue(p as! AXValue, .cgPoint, &pt)
+                return abs(pt.x - at.minX) + abs(pt.y - at.minY) < 8
+            }
+        } else { w = attr(app, "AXFocusedWindow").map { $0 as! AXUIElement } }
+        return w.flatMap { attr($0, "AXTitle") as? String }
     }
 
     private static func capture(_ rect: CGRect, done: @escaping @MainActor (Data?) -> Void) {
@@ -1133,6 +1228,8 @@ enum Guide {
         for (say, want) in [("Type: amazon.com/mc/youraccount/managePrime", "amazon.com/mc/youraccount/managePrime"),
                             ("Type: nearest Chipotle to me, then press Enter", "nearest Chipotle to me"),
                             ("Type: \"onion ring recipe\"", "onion ring recipe"), ("Type: air force 1 in the search box", "air force 1"),
+                            ("Type: 8b1f4c2a9e7d3f60.vercel-dns-017.com in the Answer / Value box", "8b1f4c2a9e7d3f60.vercel-dns-017.com"),
+                            ("Type: demo in the Host box", "demo"),
                             ("Type your email", nil), ("Click the address bar", nil)] as [(String, String?)] {
             let got = step(1, say, box).value
             ok = ok && got == want
@@ -2074,5 +2171,178 @@ extension Guide {
         func f(_ v: Double?) -> String { v.map { String(format: "%.2f s", $0) } ?? "none" }
         print("\(goal): instant ring \(f(instant)), first step \(f(first)), all \(f(all)): " + state.steps.map { "\($0.id) \($0.say)\($0.target == nil ? " (no ring)" : "")" }.joined(separator: " | "))
         WarmAgent.guide.stop()
+    }
+}
+
+// --guide-dns-check <out-prefix> (#263): the demo's flow, read-only. Connecting a domain: Vercel's domain page shows the
+// DNS record, and Porkbun's DNS form, in another Safari tab, takes it. Both screens are drawn here as plain stand-ins (no
+// real site, nothing on your screen, nothing clicked or saved anywhere); the real Guide me answers both looks, the second
+// following the first as after a tab switch. Checks: the steps stop at the tab switch, every value typed on the second
+// page was seen (on the first page or in the goal), the record's value is copied character for character, and each
+// value has its copy text. Pictures: <out>-1.png, <out>-1-steps.png, <out>-2.png, <out>-2-steps.png.
+extension Guide {
+    static let dnsValue = "8b1f4c2a9e7d3f60.vercel-dns-017.com"
+    static let dnsGoal = "Connect demo.santarow.com to my Vercel project: add the DNS record Vercel shows in Porkbun"
+
+    struct MockScreen { let png: Data; let controls: [GuideControl]; let text: String }
+
+    // A Safari window with two tabs, the first or second in front.
+    static func mockScreen(second: Bool) -> MockScreen {
+        let size = NSSize(width: 1440, height: 900)
+        var controls: [GuideControl] = [], text: [String] = []
+        func control(_ role: String, _ label: String, _ r: CGRect) { controls.append(GuideControl(n: controls.count + 1, role: role, label: label, frame: r)) }
+        let tab1 = CGRect(x: 90, y: 52, width: 420, height: 30), tab2 = CGRect(x: 514, y: 52, width: 420, height: 30)
+        let address = CGRect(x: 300, y: 12, width: 840, height: 30)
+        control("radiobutton", "demo.santarow.com – Domains – Vercel", tab1)
+        control("radiobutton", "santarow.com DNS – Porkbun", tab2)
+        control("textfield", second ? "porkbun.com/account/domainsSpeedy/dns/santarow.com" : "vercel.com/santarow/website/settings/domains", address)
+        var drawn: [(String, CGRect, CGFloat, NSColor, Bool)] = []  // text, where, size, colour, bold
+        func label(_ s: String, _ r: CGRect, _ size: CGFloat = 15, _ c: NSColor = .black, bold: Bool = false) { drawn.append((s, r, size, c, bold)); text.append(s) }
+        var boxes: [CGRect] = []
+        if !second {
+            label("Domains", CGRect(x: 80, y: 120, width: 400, height: 40), 30, bold: true)
+            label("demo.santarow.com", CGRect(x: 100, y: 200, width: 500, height: 28), 20, bold: true)
+            label("Invalid Configuration", CGRect(x: 100, y: 232, width: 300, height: 22), 15, .systemRed)
+            control("button", "Refresh", CGRect(x: 1180, y: 200, width: 90, height: 32)); boxes.append(controls.last!.frame)
+            control("button", "Edit", CGRect(x: 1280, y: 200, width: 70, height: 32)); boxes.append(controls.last!.frame)
+            label("Set the following record on your DNS provider to continue:", CGRect(x: 100, y: 290, width: 900, height: 22))
+            for (x, h) in [(100.0, "Type"), (300.0, "Name"), (500.0, "Value")] { label(h, CGRect(x: x, y: 330, width: 180, height: 20), 13, .gray, bold: true) }
+            label("CNAME", CGRect(x: 100, y: 360, width: 180, height: 22), 16)
+            label("demo", CGRect(x: 300, y: 360, width: 180, height: 22), 16)
+            label(dnsValue, CGRect(x: 500, y: 360, width: 520, height: 22), 16)
+            control("button", "Copy", CGRect(x: 1030, y: 356, width: 60, height: 28)); boxes.append(controls.last!.frame)
+            control("link", "Learn more", CGRect(x: 100, y: 410, width: 120, height: 20))
+        } else {
+            label("DNS Records", CGRect(x: 80, y: 120, width: 400, height: 40), 30, bold: true)
+            label("santarow.com", CGRect(x: 80, y: 162, width: 400, height: 22), 16, .gray)
+            for (x, h) in [(100.0, "Type"), (330.0, "Host"), (640.0, "Answer / Value"), (1030.0, "TTL")] { label(h, CGRect(x: x, y: 210, width: 220, height: 20), 13, .gray, bold: true) }
+            control("popupbutton", "A - Address record", CGRect(x: 100, y: 236, width: 210, height: 32)); boxes.append(controls.last!.frame)
+            control("textfield", "Host", CGRect(x: 330, y: 236, width: 200, height: 32)); boxes.append(controls.last!.frame)
+            label(".santarow.com", CGRect(x: 536, y: 242, width: 100, height: 20), 14, .gray)
+            control("textfield", "Answer / Value", CGRect(x: 640, y: 236, width: 370, height: 32)); boxes.append(controls.last!.frame)
+            control("textfield", "TTL 600", CGRect(x: 1030, y: 236, width: 90, height: 32)); boxes.append(controls.last!.frame)
+            control("button", "Add", CGRect(x: 1140, y: 236, width: 80, height: 32)); boxes.append(controls.last!.frame)
+            label("Current records", CGRect(x: 100, y: 320, width: 400, height: 24), 18, bold: true)
+            for (y, row) in [(356.0, ["ALIAS", "santarow.com", "cname.vercel-dns.com", "600"]), (386.0, ["CNAME", "www.santarow.com", "cname.vercel-dns.com", "600"])] {
+                for (x, v) in zip([100.0, 330.0, 640.0, 1030.0], row) { label(v, CGRect(x: x, y: y, width: 300, height: 22)) }
+            }
+        }
+        let img = NSImage(size: size, flipped: true) { _ in
+            NSColor.white.setFill(); NSRect(origin: .zero, size: size).fill()
+            NSColor(white: 0.93, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: size.width, height: 90).fill()
+            for (i, t) in [tab1, tab2].enumerated() {
+                ((i == 1) == second ? NSColor.white : NSColor(white: 0.85, alpha: 1)).setFill()
+                NSBezierPath(roundedRect: t, xRadius: 6, yRadius: 6).fill()
+                (controls[i].label as NSString).draw(in: t.insetBy(dx: 10, dy: 6), withAttributes: [.font: NSFont.systemFont(ofSize: 13)])
+            }
+            NSColor.white.setFill(); NSBezierPath(roundedRect: address, xRadius: 8, yRadius: 8).fill()
+            (controls[2].label as NSString).draw(in: address.insetBy(dx: 12, dy: 6), withAttributes: [.font: NSFont.systemFont(ofSize: 14)])
+            for b in boxes { NSColor(white: 0.6, alpha: 1).setStroke(); NSBezierPath(roundedRect: b, xRadius: 6, yRadius: 6).stroke() }
+            for c in controls where c.role == "button" || c.role == "popupbutton" || c.role == "link" {
+                (c.label as NSString).draw(in: c.frame.insetBy(dx: 8, dy: 6), withAttributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: c.role == "link" ? NSColor.systemBlue : NSColor.black])
+            }
+            for (s, r, sz, c, bold) in drawn {
+                (s as NSString).draw(in: r, withAttributes: [.font: bold ? NSFont.boldSystemFont(ofSize: sz) : NSFont.systemFont(ofSize: sz), .foregroundColor: c])
+            }
+            return true
+        }
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height), bitsPerSample: 8,
+                                   samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        img.draw(in: NSRect(origin: .zero, size: size)); NSGraphicsContext.restoreGraphicsState()
+        return MockScreen(png: rep.representation(using: .png, properties: [:]) ?? Data(), controls: controls,
+                          text: (controls.map(\.label) + text).joined(separator: " "))
+    }
+
+    // One look through the engine, as the app sends it: the picture and the controls, following the last look's session.
+    static func mockLook(_ text: String, _ screen: MockScreen, follow: String?) -> (run: String, answer: String)? {
+        guard let root = Kite.root else { return nil }
+        let tmp = FileManager.default.temporaryDirectory
+        let shot = tmp.appendingPathComponent("kite-dns-\(UUID().uuidString).png"), ctx = tmp.appendingPathComponent("kite-dns-\(UUID().uuidString).md")
+        defer { try? FileManager.default.removeItem(at: shot); try? FileManager.default.removeItem(at: ctx) }
+        try? screen.png.write(to: shot)
+        try? describe(CGRect(x: 0, y: 0, width: 1440, height: 900), CGRect(x: 0, y: 0, width: 1440, height: 900), screen.controls)
+            .write(to: ctx, atomically: true, encoding: .utf8)
+        let p = Process(), pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: root + "/" + Kite.cli)
+        p.arguments = (follow.map { ["follow", $0, text] } ?? ["run", "guide", text]) + ["--image", shot.path, "--context", ctx.path]
+        p.environment = Kite.engineEnv
+        p.standardOutput = pipe
+        try? p.run(); p.waitUntilExit()
+        let said = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard let name = said.split(separator: " ").first?.split(separator: "/").last.map(String.init) else { print("kite said: \(said)"); return nil }
+        let run = Kite.home.appendingPathComponent("agents/guide/runs/\(name)"), started = Date.now
+        while Date.now.timeIntervalSince(started) < 180 {
+            if let st = try? String(contentsOf: run.appendingPathComponent("status"), encoding: .utf8), st.trimmingCharacters(in: .whitespacesAndNewlines) != "working" {
+                let answer = (try? String(contentsOf: run.appendingPathComponent("result.md"), encoding: .utf8)) ?? ""
+                print("  answered in \(Int(Date.now.timeIntervalSince(started)))s")
+                return (name, answer)
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return nil
+    }
+
+    static func dnsCheck(out: String) {
+        dryRun = true
+        var ok = true
+        func check(_ what: String, _ pass: Bool) { print("\(pass ? "ok  " : "FAIL") \(what)"); if !pass { ok = false } }
+        func draw(_ screen: MockScreen, _ name: String) {
+            try? screen.png.write(to: URL(fileURLWithPath: "\(out)-\(name).png"))
+            let host = NSHostingView(rootView: GuideBubble(state: state).environment(\.colorScheme, .dark))
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            let win = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            win.contentView = host
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            if let bmp = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.cacheDisplay(in: host.bounds, to: bmp)
+                try? bmp.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(out)-\(name)-steps.png"))
+            }
+        }
+        func take(_ answer: String) {
+            guard let a = parse(answer) else { return }
+            for s in a.steps { addStep(say: s.say, target: s.target, kind: s.kind) }
+            state.after = a.after; state.last = a.done; state.say = a.after
+            state.phase = state.steps.isEmpty ? .done : .showing
+        }
+        state = GuideState(); seenBefore = ""; state.goal = dnsGoal; state.appName = "Safari"; lastQuestion = ""
+        // Look 1: Vercel's tab in front.
+        let one = mockScreen(second: false)
+        controls = one.controls; remember(one.controls)
+        print("== Look 1: the domain page")
+        guard let first = mockLook("Goal: \(dnsGoal)", one, follow: nil) else { print("no answer"); exit(1) }
+        print(first.answer.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").map { "  | \($0)" }.joined(separator: "\n"))
+        take(first.answer)
+        for s in state.steps { print("  \(s.id). \(s.say)\(s.target == nil ? " (not on screen)" : "")") }
+        let cut = state.steps.last.map { switchesView($0.say) } ?? false
+        check("look 1 ends at the switch to the Porkbun tab", cut && (state.steps.last?.say.lowercased().contains("porkbun") ?? false))
+        check("look 1 types nothing on Vercel's page", !state.steps.contains { $0.kind == .type })
+        draw(one, "1")
+        // Look 2: the user clicked the Porkbun tab; the title changed, so the app looks again.
+        for i in state.steps.indices { state.steps[i].done = true }
+        let two = mockScreen(second: true)
+        controls = two.controls; remember(two.controls)
+        print("== Look 2: the DNS form, another tab")
+        guard let second = mockLook("The screen changed. Goal: \(dnsGoal). What are the steps on the screen now?", two, follow: first.run)
+        else { print("no answer"); exit(1) }
+        print(second.answer.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").map { "  | \($0)" }.joined(separator: "\n"))
+        let before = state.steps.count
+        take(second.answer)
+        let fresh = Array(state.steps.dropFirst(before))
+        for s in fresh { print("  \(s.id). \(s.say)\(s.target == nil ? " (not on screen)" : "")\(s.value.map { "   [copy: \($0)]" } ?? "")") }
+        let values = fresh.compactMap(\.value)
+        check("the record's value is typed, exactly as Vercel showed it", values.contains(dnsValue))
+        check("the host is typed: demo", values.contains { $0.lowercased() == "demo" })
+        check("CNAME is picked in the Type menu", fresh.contains { $0.say.contains("CNAME") && $0.kind != .type || $0.value == "CNAME" })
+        let seen = (one.text + " " + two.text + " " + dnsGoal).lowercased()
+        let unseen = values.filter { !seen.contains($0.lowercased()) }
+        check("every value typed was seen on a screen or in the goal" + (unseen.isEmpty ? "" : ": \(unseen)"), unseen.isEmpty)
+        check("each Type step has its copy text", fresh.filter { $0.kind == .type }.allSatisfy { $0.value != nil })
+        check("the value is on the Answer box, not a lookalike from the current records", fresh.first { $0.value == dnsValue }?.control == two.controls.first { $0.label == "Answer / Value" }?.n)
+        check("the guard counts the first screen as seen", madeUp("Type: https://vercel.com/santarow/website/settings/domains in the Notes box") == nil
+              && madeUp("Type: https://vercel.com/santarow/other-made-up-page in the Notes box") != nil)
+        draw(two, "2")
+        print(ok ? "all passed" : "SOME FAILED")
+        exit(ok ? 0 : 1)
     }
 }
