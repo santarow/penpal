@@ -661,6 +661,13 @@ private struct OverlayView: View {
             .buttonStyle(TilePress())
             .help("Enhance: turn a rough ask into a clear prompt. Write it rough, with pictures; your Claude rewrites it")
             .padding(.horizontal, 12).padding(.bottom, 8) }
+            // Take to Chat (#325): the Code session in front, as a spoken briefing in a new Claude chat, for voice on the phone.
+            if Enhance.available { Button { TakeToChat.start() } label: {
+                DockRow(icon: "car.fill", color: .teal, title: "Take to Chat")
+            }
+            .buttonStyle(TilePress())
+            .help("Take to Chat: your Claude writes a short spoken briefing of the Claude Code session in front and sends it as a new Claude chat, to talk through by voice on your iPhone")
+            .padding(.horizontal, 12).padding(.bottom, 8) }
             // Talk to Kite: hold the tile and speak; let go to send. Breathes while it thinks and talks.
             // Workbench (lite) or Workshop (full): the same app, with or without what runs Claude.
             // For trying both while building; a release build is one or the other.

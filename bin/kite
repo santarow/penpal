@@ -9,6 +9,8 @@
   kite session <file.jsonl>        one session's turns: prompt, answer, tokens, images (saved under ~/.kite/history)
   kite usage [today|7]             live tokens from local transcripts + plan limits and their /usage history, as JSON
   kite limits                      plan limits from Claude Code's /usage (no model call, zero tokens)
+  kite brief [session]             a Claude Code session made ready for a spoken briefing, as JSON: the one last in
+                                   front in the Claude app's Code tab (or that id), its latest turns, keys and tokens taken out
   kite commands [refresh]          Claude Code commands, your skills, and keys incl. your keybindings.json, as JSON
                                    (refresh re-downloads the lists from code.claude.com/docs)
 Options for run and follow: --kind pull|chat|..., --context file.md (sent first, not shown),
@@ -1196,6 +1198,55 @@ def _ldb_blocks(raw):
         yield block(off, size)
 
 
+# Anything that looks like a key, token or password, taken out before a session goes to Claude for a briefing (#325).
+SECRET_PATTERNS = [
+    r"sk-ant-[A-Za-z0-9_-]{10,}", r"\bsk-[A-Za-z0-9_-]{20,}", r"\bgh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
+    r"\bAKIA[0-9A-Z]{16}\b", r"\bxox[abprs]-[A-Za-z0-9-]{10,}", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b",
+    r"(?i)\b(api[_-]?key|secret|token|password|passwd|bearer|authorization)\b(\s*[:=]\s*|\s+)[\"']?[A-Za-z0-9_./+=-]{12,}[\"']?",
+]
+
+
+def scrub(text):
+    for p in SECRET_PATTERNS:
+        text = re.sub(p, "[removed]", text)
+    return text
+
+
+def cmd_brief(cli_id=None):
+    """A Claude Code session made ready for a spoken briefing (#325, Jason: "summarize the current session and pass it
+    to claude chat, so i can talk about the content while i drive"). The session: the one the Claude app's Code tab had
+    in front last (its lastFocusedAt), or the id given. Its latest turns, newest last, up to about 30,000 characters,
+    with a line on how it started; anything like a key or token taken out. JSON: {id, title, turns, text}."""
+    cur = _current_account()
+    recs = [d for d in _app_records() if d.get("cliSessionId") and not d.get("isArchived") and (cur is None or d["_account"] == cur)]
+    if cli_id:
+        rec = next((d for d in recs if cli_id in (d.get("cliSessionId"), d.get("sessionId"))), {"cliSessionId": cli_id})
+    else:
+        rec = max(recs, key=lambda d: d.get("lastFocusedAt") or d.get("lastActivityAt") or 0, default=None)
+    if not rec:
+        die("no Claude Code session in the Claude app")
+    cid = rec["cliSessionId"]
+    files = sorted(CLAUDE_PROJECTS.glob(f"*/{cid}.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not files:
+        die(f"no transcript for {cid}")
+    turns = [t for t in _session_turns(files[-1]) if t.get("prompt") or t.get("answer")]
+    if not turns:
+        die("that session has no turns yet")
+    parts, size = [], 0
+    for t in reversed(turns):
+        piece = f"User: {t.get('prompt', '').strip()}\n\nClaude: {t.get('answer', '').strip()[:6000]}"
+        if size + len(piece) > 30000 and parts:
+            break
+        parts.insert(0, piece)
+        size += len(piece)
+    head = f"Session: {rec.get('title') or 'untitled'}, in {Path(rec.get('cwd') or '').name or 'a folder'}."
+    if len(parts) < len(turns):
+        head += f" Earlier ({len(turns) - len(parts)} turns not shown) it started with: {turns[0].get('prompt', '')[:400].strip()}"
+    print(json.dumps({"id": cid, "title": rec.get("title") or "", "turns": len(turns), "shown": len(parts),
+                      "text": scrub(head + "\n\n" + "\n\n---\n\n".join(parts))}))
+
+
 def cmd_app_session(cli_id):
     """The Claude app's own id for a Claude Code session (its claude://code/ links use it), read
     from the app's session records (an undocumented format: nothing found prints nothing). "here"
@@ -1327,6 +1378,8 @@ def main(argv):
         cmd_session(*argv[1:])
     elif argv == ["app-sidebar"]:
         cmd_app_sidebar()
+    elif argv and argv[0] == "brief" and len(argv) <= 2:
+        cmd_brief(*argv[1:])
     elif len(argv) == 2 and argv[0] == "app-session":
         cmd_app_session(argv[1])
     elif argv == ["app-accounts"]:

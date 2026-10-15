@@ -1,0 +1,9 @@
+{
+  "icon": "car.fill",
+  "hidden": true,
+  "model": "claude-sonnet-5-5",
+  "tools": [],
+  "mcp": [],
+  "maxTurns": 1,
+  "effort": "low"
+}

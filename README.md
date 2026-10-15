@@ -12,7 +12,11 @@ A Mac app that helps you write to Claude. Made by SantaRow.
 - **Guide me:** say what you want to do in an app. Penpal rings the next thing to click, one step at a time.
 - **Enhance:** turns a rough ask, and its pictures, into a clear prompt before you send it.
 - **Claude History:** every Claude Code session on this Mac, searchable, with resume and fork.
+- **Take to Chat:** a short spoken briefing of the Claude Code session you're in, sent as a new Claude chat, to
+  talk through by voice on your phone.
 - **Usage:** your plan's limits and tokens over time.
+
+Highlight, snippets and Enhance send to Claude's message box, or to Grok Bot's (Settings › Highlight › Send to).
 
 ## What you need
 

@@ -328,7 +328,7 @@ enum Enhance {
             guard sent.ok else {
                 Log.line("enhance: not sent (\(sent.why)); kept, and the words copied")
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
-                model.note = "Not sent: \(sent.why) Nothing here was cleared, and the words are on the clipboard: click in Claude's message box and press ⌘V."
+                model.note = "Not sent: \(sent.why) Nothing here was cleared, and the words are on the clipboard: click in \(Paster.targetName)'s message box and press ⌘V."
                 open()
                 return
             }
@@ -431,7 +431,7 @@ struct EnhanceView: View {
                 Text("⌘↩").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Copy") { Enhance.copy() }.disabled(model.result.isEmpty)
-                Button { Enhance.send() } label: { Label("Send to Claude", systemImage: "paperplane.fill") }
+                Button { Enhance.send() } label: { Label("Send to \(Paster.targetName)", systemImage: "paperplane.fill") }  // or Grok Bot (#336)
                     .buttonStyle(.borderedProminent)
                     .disabled(model.working || (model.result.isEmpty && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.shots.isEmpty))
                     .help(model.result.isEmpty ? "Sends your ask as you wrote it, with the pictures" : "Sends the enhanced prompt, with the pictures")

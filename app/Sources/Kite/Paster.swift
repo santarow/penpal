@@ -9,7 +9,7 @@ enum Paster {
     // Otherwise nothing is deleted or typed.
     static func paste(_ text: String, deleting count: Int = 0, into pid: pid_t) {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return Log.line("snippet: its app isn't in front, nothing typed") }
-        guard let f = focusedElement(pid), isPrompt(f), showing(f, pid) else { return Log.line("snippet: not in Claude's message box (\(describe(focusedElement(pid)))), nothing typed") }
+        guard let f = focusedElement(pid), isPrompt(f), showing(f, pid) else { return Log.line("snippet: not in the message box (\(describe(focusedElement(pid)))), nothing typed") }
         paste(deleting: count) { $0.setString(text, forType: .string) }
     }
 
@@ -26,12 +26,13 @@ enum Paster {
         restore(board, saved, ifStill: ours)
     }
 
-    // Where lens buttons and screenshots go: Claude's message box (default), or the app in front.
+    // Where lens buttons and screenshots go: Claude's message box (default), Grok Bot's (#336), or the app in front.
     enum Target: String, CaseIterable {
-        case claude, chat, front, clipboard
+        case claude, grok, chat, front, clipboard
         var label: String {
             switch self {
             case .claude: Flavor.current.has(.chat) ? "Claude's message box (\(AppName.shown)'s Chat if Claude is closed)" : "Claude's message box"
+            case .grok: "Grok Bot's message box"
             case .chat: "\(AppName.shown)'s Chat"
             case .front: "The app in front"
             case .clipboard: "Clipboard (you press ⌘V where you want it)"
@@ -40,6 +41,19 @@ enum Paster {
     }
     static let targetKey = "pasteTarget"
     static var target: Target { Target(rawValue: UserDefaults.standard.string(forKey: targetKey) ?? "") ?? .claude }
+    // The chat app the target names, if it names one: its bundle IDs and its name (#336).
+    static var chatTarget: (ids: Set<String>, name: String)? {
+        switch target {
+        case .claude: (Expander.claudeApps, "Claude")
+        case .grok: (Expander.grokApps, "Grok Bot")
+        default: nil
+        }
+    }
+    // Where Send and pastes go, by name: "Claude" or "Grok Bot" (Claude when the target names no chat app).
+    static var targetName: String { chatTarget?.name ?? "Claude" }
+    private static var targetApp: NSRunningApplication? {
+        chatTarget?.ids.lazy.compactMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0).first }.first
+    }
 
     static func pasteIntoClaude(_ text: String) {
         if target == .clipboard { return copy("text") { $0.setString(text, forType: .string) } }
@@ -60,7 +74,7 @@ enum Paster {
         if Flavor.current.has(.chat), target == .chat || (target == .claude && claudeApp == nil) {
             return AgentStore.shared.attach(png)
         }
-        if !Flavor.current.has(.chat), target == .claude, claudeApp == nil {
+        if (!Flavor.current.has(.chat) && target == .claude || target == .grok), targetApp == nil {  // not running: it waits on the clipboard
             return copy("image") { board in
                 board.setData(png, forType: .png)
                 if let tiff = NSImage(data: png)?.tiffRepresentation { board.setData(tiff, forType: .tiff) }
@@ -73,7 +87,7 @@ enum Paster {
                 if let tiff { board.setData(tiff, forType: .tiff) }
             }
         }
-        deliver("image", label: numberPictures && claudeApp != nil && target == .claude ? pictureLabel() : nil) { board in
+        deliver("image", label: numberPictures && targetApp != nil && chatTarget != nil ? pictureLabel() : nil) { board in
             board.setData(png, forType: .png)
             if let tiff { board.setData(tiff, forType: .tiff) }
         }
@@ -104,7 +118,7 @@ enum Paster {
                 return Log.line("copied \(what) (no \(Permissions.controlName) to paste it)")
             }
             let pid = app.processIdentifier
-            let isClaude = Expander.claudeApps.contains(app.bundleIdentifier ?? "")
+            let isClaude = Expander.promptApps.contains(app.bundleIdentifier ?? "")  // Claude or Grok Bot: its message box only
             Log.line("paste \(what) into \(app.bundleIdentifier ?? "?")")
             let board = NSPasteboard.general
             let saved = save(board)
@@ -208,11 +222,11 @@ enum Paster {
             guard let app else { return done(Sent(ok: false, why: "Claude isn't running.", note: "")) }
             guard AXIsProcessTrusted() else { return done(Sent(ok: false, why: "\(AppName.shown) needs \(Permissions.controlName) to paste.", note: "")) }
             let pid = app.processIdentifier, board = NSPasteboard.general, saved = save(board)
-            let isClaude = Expander.claudeApps.contains(app.bundleIdentifier ?? "")
+            let isClaude = Expander.promptApps.contains(app.bundleIdentifier ?? "")  // Claude or Grok Bot: its message box only
             if isClaude { Log.line("send: prompt box \(focusPrompt(pid))") }
             guard !isClaude || (focusedElement(pid).map { isPrompt($0) && showing($0, pid) } ?? false) else {
-                Log.line("send: Claude's message box not found, nothing typed")
-                return done(Sent(ok: false, why: "Couldn't find Claude's message box.", note: ""))
+                Log.line("send: \(targetName)'s message box not found, nothing typed")
+                return done(Sent(ok: false, why: "Couldn't find \(targetName)'s message box.", note: ""))
             }
             let wordsBefore = isClaude ? promptText(pid) ?? "" : "", sizeBefore = isClaude ? composerSize(pid) : nil
             @MainActor func paste(_ write: (NSPasteboard) -> Void) {
@@ -237,13 +251,13 @@ enum Paster {
                     let flat = { (t: String) in t.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
                     let head = String(flat(text).prefix(60))
                     if !text.isEmpty, let now = promptText(pid), now == wordsBefore || !flat(now).contains(head) {  // unreadable: can't tell
-                        why = "The words didn't show up in Claude's message box."
+                        why = "The words didn't show up in \(targetName)'s message box."
                     } else if !pngs.isEmpty, let a = sizeBefore, let b = composerSize(pid), b <= a {
-                        why = "The pictures didn't show up in Claude's message box."
+                        why = "The pictures didn't show up in \(targetName)'s message box."
                     }
                 }
                 if why.isEmpty { restore(board, saved, ifStill: board.changeCount) }
-                Log.line(why.isEmpty ? "send: seen in Claude's message box" : "send: NOT sent: \(why)")
+                Log.line(why.isEmpty ? "send: seen in \(targetName)'s message box" : "send: NOT sent: \(why)")
                 done(Sent(ok: why.isEmpty, why: why, note: "\(ms)ms\(note)"))
             }
         }
@@ -306,7 +320,7 @@ enum Paster {
     // went to YouTube), and wait until it really is in front.
     private static func pickTarget(pause: Double = 0.15, _ then: @escaping @MainActor (NSRunningApplication?) -> Void) {
         let front = NSWorkspace.shared.frontmostApplication
-        if target != .claude {  // .chat never gets here: text goes to the front app
+        guard let chat = chatTarget else {  // .chat never gets here: text goes to the front app
             // Penpal itself in front (a click on its dock, #269): never into Penpal; the app before it comes back first.
             if front == NSRunningApplication.current, let other = OtherApp.last, !other.isTerminated {
                 other.activate()
@@ -314,12 +328,12 @@ enum Paster {
             }
             return then(front)
         }
-        if let front, Expander.claudeApps.contains(front.bundleIdentifier ?? "") { return then(front) }
-        guard let claude = claudeApp else {
-            Log.line("Claude not running, nothing pasted")
+        if let front, chat.ids.contains(front.bundleIdentifier ?? "") { return then(front) }
+        guard let claude = targetApp else {
+            Log.line("\(chat.name) not running, nothing pasted")
             return then(nil)
         }
-        Log.line("bringing Claude forward (front was \(front?.bundleIdentifier ?? "?"))")
+        Log.line("bringing \(chat.name) forward (front was \(front?.bundleIdentifier ?? "?"))")
         if let url = claude.bundleURL {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
@@ -338,7 +352,7 @@ enum Paster {
                                        _ then: @escaping @MainActor (NSRunningApplication?) -> Void) {
         let waited = Date.now.timeIntervalSince(since)
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier || waited > 2 {
-            Log.line("Claude \(waited > 2 ? "still not in front after 2 s, pasting anyway" : "in front after \(Int(waited * 1000))ms")")
+            Log.line("\(app.localizedName ?? "the app") \(waited > 2 ? "still not in front after 2 s, pasting anyway" : "in front after \(Int(waited * 1000))ms")")
             // A short pause once it is in front, so its window is ready for focus and paste.
             DispatchQueue.main.asyncAfter(deadline: .now() + pause) { then(app) }
             return
@@ -411,7 +425,7 @@ enum Paster {
     // Edit > Paste, or ⌘V while that app is in front. False when it can't: nothing is typed anywhere.
     private static func pasteInto(_ pid: pid_t, claude: Bool) -> Bool {
         if claude, !(focusedElement(pid).map { isPrompt($0) && showing($0, pid) } ?? false) {
-            Log.line("paste: focus isn't Claude's message box (\(describe(focusedElement(pid)))), nothing typed")
+            Log.line("paste: focus isn't \(targetName)'s message box (\(describe(focusedElement(pid)))), nothing typed")
             return false
         }
         if pressMenuPaste(pid) { Log.line("pressed Edit > Paste"); return true }
@@ -423,12 +437,102 @@ enum Paster {
         press(9, CGEventSource(stateID: .combinedSessionState), flags: .maskCommand)
         return true
     }
-    // --paste-target-check (#319): where a paste into Claude would go now, read-only (nothing focused, typed or clicked).
-    static func targetCheck() {
-        guard let claude = claudeApp else { print("Claude isn't running"); exit(1) }
+    // A new chat in Claude's Chat tab with `text` in it, then sent, so it's on your iPhone too (#325, Take to Chat). The
+    // chat is opened by Claude's own link (claude://claude.ai/new?q=…, the Chat tab), and sent only once the words are
+    // seen in the message box Claude shows; its Send button is pressed, and the box emptying says it went. Anything
+    // that can't be seen: the words on the clipboard, and said. `done` gets "sent", "filled" (in the box, not sent) or
+    // "copied".
+    static func startChat(_ text: String, done: @escaping @MainActor (String) -> Void) {
+        func copied(_ why: String) {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+            Log.line("chat: \(why); the briefing is on the clipboard")
+            done("copied")
+        }
+        guard let claude = claudeApp else { return copied("Claude isn't running") }
+        guard AXIsProcessTrusted() else { return copied("no \(Permissions.controlName)") }
+        var c = URLComponents(string: "claude://claude.ai/new")!
+        c.queryItems = [URLQueryItem(name: "surface", value: "chat"), URLQueryItem(name: "q", value: text)]
+        guard let url = c.url else { return copied("no link") }
         let pid = claude.processIdentifier
+        let flat = { (t: String) in t.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        let head = String(flat(text).prefix(50))
+        // Anywhere in the front window: the words as a sent message (if the link sent them itself).
+        func windowShows() -> Bool {
+            guard let w = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") else { return false }
+            var queue = [w as! AXUIElement], n = 0
+            while !queue.isEmpty, n < 6000 {
+                let e = queue.removeFirst(); n += 1
+                if !isPrompt(e), let v = (attr(e, "AXValue") as? String) ?? (attr(e, "AXDescription") as? String), flat(v).contains(head) { return true }
+                queue += (attr(e, "AXChildren") as? [AXUIElement]) ?? []
+            }
+            return false
+        }
+        func box() -> AXUIElement? {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                  let w = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") else { return nil }
+            return findPrompt(in: w as! AXUIElement, pid)
+        }
+        // Within 160 points of the message box: the composer, not a button elsewhere on the page.
+        func near(_ e: AXUIElement) -> Bool {
+            func frame(_ x: AXUIElement) -> CGRect? {
+                guard let p = attr(x, "AXPosition"), let z = attr(x, "AXSize") else { return nil }
+                var pt = CGPoint.zero, sz = CGSize.zero
+                AXValueGetValue(p as! AXValue, .cgPoint, &pt); AXValueGetValue(z as! AXValue, .cgSize, &sz)
+                return CGRect(origin: pt, size: sz)
+            }
+            guard let b = box().flatMap(frame), let f = frame(e) else { return false }
+            return b.insetBy(dx: -160, dy: -160).intersects(f)
+        }
+        func sendButton() -> AXUIElement? {
+            guard let w = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") else { return nil }
+            var queue = [w as! AXUIElement], n = 0
+            while !queue.isEmpty, n < 6000 {
+                let e = queue.removeFirst(); n += 1
+                // Exactly "Send" or "Send message", and beside the box: "send" at the start matched Claude's "Send feedback" (#325).
+                if attr(e, "AXRole") as? String == "AXButton",
+                   ["AXDescription", "AXTitle"].contains(where: { ["send", "send message"].contains((attr(e, $0) as? String)?.lowercased() ?? "") }),
+                   showing(e, pid), near(e) { return e }
+                queue += (attr(e, "AXChildren") as? [AXUIElement]) ?? []
+            }
+            return nil
+        }
+        NSWorkspace.shared.open(url)
+        Log.line("chat: opened a new chat in Claude with the briefing (\(text.count) characters)")
+        let started = Date.now
+        @MainActor func waitForWords() {
+            if let b = box(), let v = attr(b, "AXValue") as? String, flat(v).contains(head) {
+                Log.line("chat: the briefing is in the message box after \(Int(Date.now.timeIntervalSince(started) * 1000))ms")
+                guard let send = sendButton(), AXUIElementPerformAction(send, kAXPressAction as CFString) == .success else {
+                    Log.line("chat: no Send button to press; left in the box")
+                    return done("filled")
+                }
+                let pressed = Date.now
+                @MainActor func waitForSent() {
+                    let still = box().flatMap { attr($0, "AXValue") as? String }.map { flat($0).contains(head) } ?? false
+                    if !still { Log.line("chat: sent"); return done("sent") }
+                    if Date.now.timeIntervalSince(pressed) > 4 { Log.line("chat: Send pressed, still in the box"); return done("filled") }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { MainActor.assumeIsolated { waitForSent() } }
+                }
+                return waitForSent()
+            }
+            if Date.now.timeIntervalSince(started) > 8 {
+                if windowShows() { Log.line("chat: the briefing shows in the chat already"); return done("sent") }
+                return copied("the briefing didn't show up in a new chat")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { MainActor.assumeIsolated { waitForWords() } }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { waitForWords() } }
+    }
+
+    // --paste-target-check (#319): where a paste into Claude would go now, read-only (nothing focused, typed or clicked).
+    static func targetCheck(grok: Bool = false) {
+        let ids = grok ? Expander.grokApps : Expander.claudeApps, name = grok ? "Grok Bot" : "Claude"
+        guard let claude = ids.lazy.compactMap({ NSRunningApplication.runningApplications(withBundleIdentifier: $0).first }).first
+        else { print("\(name) isn't running"); exit(1) }
+        let pid = claude.processIdentifier, t0 = Date.now
+        defer { print("check took \(Int(Date.now.timeIntervalSince(t0) * 1000))ms") }
         let focus = focusedElement(pid)
-        print("focus in Claude: \(describe(focus)) -> \(focus.map { isPrompt($0) && showing($0, pid) } == true ? "its message box: would paste" : "not its message box showing: would look for it")")
+        print("focus in \(name): \(describe(focus)) -> \(focus.map { isPrompt($0) && showing($0, pid) } == true ? "its message box: would paste" : "not its message box showing: would look for it")")
         if let w = attr(AXUIElementCreateApplication(pid), "AXFocusedWindow") {
             // Every box named as a prompt in the window, and what's at its middle (roles and names only).
             var queue = [w as! AXUIElement], seen = 0
@@ -443,7 +547,9 @@ enum Paster {
                 }
                 queue += (attr(e, "AXChildren") as? [AXUIElement]) ?? []
             }
+            let t1 = Date.now
             let box = findPrompt(in: w as! AXUIElement, pid)
+            print("finding the box as a paste does: \(Int(Date.now.timeIntervalSince(t1) * 1000))ms")
             print("message box in its window: \(box.map(describe) ?? "none found: the picture would wait on the clipboard")")
         }
         exit(0)
@@ -451,7 +557,7 @@ enum Paster {
     // When it couldn't paste: it stays on the clipboard (not put back), and you're told.
     private static func leftOnClipboard(_ what: String, claude: Bool) {
         NSSound(named: "Pop")?.play()
-        Notice.show(claude ? "Copied. Click in Claude's message box and press ⌘V." : "Copied. Press ⌘V where you want it.")
+        Notice.show(claude ? "Copied. Click in \(targetName)'s message box and press ⌘V." : "Copied. Press ⌘V where you want it.")
         Log.line("\(what) left on the clipboard: nowhere safe to paste")
     }
 

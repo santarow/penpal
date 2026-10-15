@@ -7,6 +7,9 @@ import ApplicationServices
 @MainActor
 final class Expander: ObservableObject {
     static let claudeApps: Set<String> = ["com.anthropic.claudefordesktop"]
+    static let grokApps: Set<String> = ["com.anysphere.sand"]  // Grok Bot (#336)
+    // Apps whose message box Penpal pastes into and snippets expand in: Claude and Grok Bot.
+    static let promptApps = claudeApps.union(grokApps)
 
     @Published private(set) var trusted = AXIsProcessTrusted()
     @Published var enabled = true
@@ -43,13 +46,13 @@ final class Expander: ObservableObject {
     private func handle(_ event: NSEvent) {
         // Return in Claude sends the message: the next picture is 🖼 1 again. (Shift-Return is a new line.)
         if event.keyCode == 36, event.modifierFlags.isDisjoint(with: [.shift, .option, .command, .control]),
-           let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, Self.claudeApps.contains(front),
+           let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, Self.promptApps.contains(front),
            UserDefaults.standard.double(forKey: "pictures.at") > 0 {
             Paster.resetPictures()
         }
         guard enabled, Features.on(.lenses),
               let app = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-              Self.claudeApps.contains(app),
+              Self.promptApps.contains(app),
               event.modifierFlags.isDisjoint(with: [.command, .control, .option])
         else { buffer = ""; return }
 

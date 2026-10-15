@@ -164,8 +164,13 @@ struct KiteApp: App {
             let out = args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { EnhanceHistory.check(out: out) } }
         }
+        if let i = args.firstIndex(of: "--brief-check"), i + 1 < args.count {  // Take to Chat's briefing, not sent (#325)
+            let out = args[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { TakeToChat.check(out: out) } }
+        }
         if args.contains("--paste-target-check") {  // where a paste into Claude would go now, read-only (#319)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Paster.targetCheck() } }
+            let grok = args.contains("grok")  // Grok Bot's box instead (#336)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Paster.targetCheck(grok: grok) } }
         }
         if args.contains("--guide-read-check") {  // what a look reads, counted per window (#263)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { Guide.readCheck() } }
@@ -337,6 +342,7 @@ struct MagicItems: View {
         if highlight { Button("Highlight  \(highlighter.keysLabel)") { highlighter.startFromButton() } }
         if Features.on(.guide) { Button("Guide me…") { Guide.start() } }
         if Enhance.available { Button("Enhance…") { Enhance.open() } }
+        if Enhance.available { Button("Take to Chat") { TakeToChat.start() } }  // #325
     }
 }
 
@@ -909,6 +915,7 @@ struct SettingsView: View {
         } footer: {
             Text(target == .claude
                  ? "Claude comes forward and the paste lands in its message box, from any app. " + (Flavor.current.has(.chat) ? "If Claude is closed, screenshots go to \(AppName.shown)'s Chat." : "If Claude is closed, a picture waits on the clipboard.")
+                 : target == .grok ? "Grok Bot comes forward and the paste lands in its message box, from any app. If Grok Bot is closed, a picture waits on the clipboard."
                  : target == .chat ? "Screenshots open in \(AppName.shown)'s Chat, ready for your question."
                  : target == .clipboard ? "Nothing is pasted for you. You'll hear a pop, then press ⌘V in any app."
                  : "Pastes into whatever app you are in.")
